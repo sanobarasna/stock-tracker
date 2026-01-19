@@ -122,7 +122,6 @@ def cleanup_bad_rows_and_repair_stock():
            or trim(barcode) = '' 
            or lower(trim(barcode)) = 'barcode'
            or barcode ~ '^[[:space:]]*barcode[[:space:]]*
-        """
 
 
 def ensure_stock_row(barcode: str):
