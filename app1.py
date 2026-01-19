@@ -122,9 +122,7 @@ def cleanup_bad_rows_and_repair_stock():
            or trim(barcode) = '' 
            or lower(trim(barcode)) = 'barcode'
            or barcode ~ '^[[:space:]]*barcode[[:space:]]*
-        """
-    )
-           
+
 
 def ensure_stock_row(barcode: str):
     execute(
@@ -546,8 +544,10 @@ with tab2:
           coalesce(s.updated_at, now()) as updated_at
         from public.products p
         left join public.stock s on s.barcode = p.barcode
-        where lower(trim(p.barcode)) not in ('barcode','')
-          and lower(trim(p.description)) not in ('description','')
+        where trim(p.barcode) != ''
+          and trim(p.description) != ''
+          and lower(trim(p.barcode)) != 'barcode'
+          and lower(trim(p.description)) != 'description'
         order by p.description;
     """)
 
