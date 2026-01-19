@@ -54,6 +54,7 @@ def execute(sql: str, params=None, fetchone=False, fetchall=False):
                 return cur.fetchone()
             if fetchall:
                 return cur.fetchall()
+        conn.commit()
     return None
 
 
