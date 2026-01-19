@@ -1,18 +1,12 @@
-# app.py
-# Pack Split Tracker (Supabase / Postgres)
-# - Products master (AUTO / MANUAL / NONE)
-# - Stock snapshot (unopened boxes, singles, 6pk)
-# - Daily open log (history)
-# - After-save: show unopened boxes still in stock
-# - Undo last entry
-# - Export stock position + logs
-
 import os
+import socket
+from urllib.parse import urlparse, unquote
 from datetime import date
+
 import pandas as pd
 import streamlit as st
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_values
 
 
 # -----------------------------
@@ -22,23 +16,53 @@ st.set_page_config(page_title="Pack Split Tracker (Supabase)", layout="wide")
 
 
 # -----------------------------
-# DB Connection + helpers
+# DB Connection (IPv4-safe)
 # -----------------------------
+def _get_database_url() -> str:
+    if "DATABASE_URL" in st.secrets:
+        return st.secrets["DATABASE_URL"]
+    env = os.getenv("DATABASE_URL", "")
+    return env
+
+
 @st.cache_resource(show_spinner=False)
 def get_conn():
-    db_url = None
-    if "DATABASE_URL" in st.secrets:
-        db_url = st.secrets["DATABASE_URL"]
-    else:
-        db_url = os.getenv("DATABASE_URL")
-
+    db_url = _get_database_url()
     if not db_url:
-        raise RuntimeError(
-            "DATABASE_URL is not set. Add it in Streamlit Secrets as DATABASE_URL."
-        )
+        raise RuntimeError("DATABASE_URL is not set in Streamlit secrets or environment.")
 
-    # Supabase requires SSL
-    conn = psycopg2.connect(db_url, cursor_factory=RealDictCursor, sslmode="require")
+    u = urlparse(db_url)
+
+    if u.scheme not in ("postgres", "postgresql"):
+        raise RuntimeError("DATABASE_URL must start with postgresql:// or postgres://")
+
+    host = u.hostname
+    port = u.port or 5432
+    user = unquote(u.username or "")
+    password = unquote(u.password or "")
+    dbname = (u.path or "").lstrip("/") or "postgres"
+
+    if not host or not user:
+        raise RuntimeError("DATABASE_URL is missing host or user.")
+
+    # Force IPv4 to avoid Streamlit Cloud IPv6 routing issues.
+    try:
+        hostaddr = socket.gethostbyname(host)  # returns IPv4 A record
+    except Exception as e:
+        raise RuntimeError(f"Failed to resolve IPv4 for host '{host}': {e}")
+
+    # NOTE: host is still passed for TLS/SNI; hostaddr is used for actual network connection.
+    conn = psycopg2.connect(
+        dbname=dbname,
+        user=user,
+        password=password,
+        host=host,
+        hostaddr=hostaddr,
+        port=port,
+        sslmode="require",
+        connect_timeout=10,
+        cursor_factory=RealDictCursor,
+    )
     return conn
 
 
@@ -48,9 +72,13 @@ def execute(sql: str, params=None, fetchone=False, fetchall=False):
     with conn.cursor() as cur:
         cur.execute(sql, params)
         if fetchone:
-            return cur.fetchone()
+            row = cur.fetchone()
+            conn.commit()
+            return row
         if fetchall:
-            return cur.fetchall()
+            rows = cur.fetchall()
+            conn.commit()
+            return rows
     conn.commit()
     return None
 
@@ -62,7 +90,7 @@ def read_df(sql: str, params=None) -> pd.DataFrame:
 
 
 def init_db():
-    # Create tables if they don't exist (safe to run on every app start)
+    # Safe to run every time
     execute(
         """
         create table if not exists products (
@@ -76,7 +104,6 @@ def init_db():
         );
         """
     )
-
     execute(
         """
         create table if not exists stock (
@@ -88,7 +115,6 @@ def init_db():
         );
         """
     )
-
     execute(
         """
         create table if not exists open_log (
@@ -103,7 +129,6 @@ def init_db():
         );
         """
     )
-
     execute("create index if not exists idx_open_log_date on open_log(log_date);")
     execute("create index if not exists idx_open_log_barcode on open_log(barcode);")
 
@@ -119,14 +144,7 @@ def ensure_stock_row(barcode: str):
     )
 
 
-def upsert_product(
-    barcode: str,
-    description: str,
-    pack_size,
-    split_mode: str,
-    auto_singles: int,
-    auto_sixpk: int,
-):
+def upsert_product(barcode: str, description: str, pack_size, split_mode: str, auto_singles: int, auto_sixpk: int):
     execute(
         """
         insert into products (barcode, description, pack_size, split_mode, auto_singles_per_box, auto_sixpk_per_box)
@@ -146,7 +164,7 @@ def upsert_product(
 def get_product(barcode: str) -> dict:
     row = execute("select * from products where barcode=%s;", (barcode,), fetchone=True)
     if not row:
-        raise ValueError("Product not found. Add it in Add / Edit Products tab.")
+        raise ValueError("Product not found. Add it in Add / Edit Products.")
     return dict(row)
 
 
@@ -171,14 +189,7 @@ def set_stock(barcode: str, closed_boxes: int, singles: int, sixpk: int):
     )
 
 
-def apply_opening(
-    log_date: date,
-    barcode: str,
-    boxes_opened: int,
-    singles_made: int,
-    sixpk_made: int,
-    note: str = "",
-):
+def apply_opening(log_date: date, barcode: str, boxes_opened: int, singles_made: int, sixpk_made: int, note: str = ""):
     prod = get_product(barcode)
     stk = get_stock(barcode)
 
@@ -192,14 +203,12 @@ def apply_opening(
         derived_sixpk = boxes_opened * int(prod.get("auto_sixpk_per_box") or 0)
         singles_to_store = 0
         sixpk_to_store = 0
-
     elif split_mode == "MANUAL":
         derived_singles = int(singles_made or 0)
         derived_sixpk = int(sixpk_made or 0)
         singles_to_store = derived_singles
         sixpk_to_store = derived_sixpk
-
-    else:  # NONE
+    else:
         derived_singles = 0
         derived_sixpk = 0
         singles_to_store = 0
@@ -231,14 +240,7 @@ def apply_opening(
 
 
 def undo_last_entry():
-    last = execute(
-        """
-        select * from open_log
-        order by id desc
-        limit 1;
-        """,
-        fetchone=True,
-    )
+    last = execute("select * from open_log order by id desc limit 1;", fetchone=True)
     if not last:
         return False, None
 
@@ -279,7 +281,7 @@ def undo_last_entry():
 
 
 # -----------------------------
-# App start
+# UI
 # -----------------------------
 st.title("📦 Pack Split Tracker (Supabase/Postgres)")
 
@@ -292,9 +294,6 @@ except Exception as e:
 tab1, tab2, tab3 = st.tabs(["✅ Daily Entry", "📊 Dashboard", "➕ Add / Edit Products"])
 
 
-# -----------------------------
-# Tab 3: Add / Edit Products + Set Stock
-# -----------------------------
 with tab3:
     st.subheader("Add / Edit a product")
 
@@ -322,18 +321,15 @@ with tab3:
         if not barcode_in or not desc_in:
             st.error("Barcode and Description are required.")
         else:
-            try:
-                upsert_product(
-                    barcode=barcode_in,
-                    description=desc_in,
-                    pack_size=int(pack_size_in) if pack_size_in else None,
-                    split_mode=split_mode_in,
-                    auto_singles=int(auto_singles_in),
-                    auto_sixpk=int(auto_sixpk_in),
-                )
-                st.success("Saved product.")
-            except Exception as e:
-                st.error(f"Failed to save product: {e}")
+            upsert_product(
+                barcode=barcode_in,
+                description=desc_in,
+                pack_size=int(pack_size_in) if pack_size_in else None,
+                split_mode=split_mode_in,
+                auto_singles=int(auto_singles_in),
+                auto_sixpk=int(auto_sixpk_in),
+            )
+            st.success("Saved product.")
 
     st.divider()
     st.subheader("Set / correct current stock snapshot")
@@ -348,12 +344,7 @@ with tab3:
             format_func=lambda b: f"{products_df.loc[products_df['barcode']==b,'description'].iloc[0]} ({b})",
         )
 
-        try:
-            cur = get_stock(picked_barcode)
-        except Exception as e:
-            st.error(f"Unable to load stock: {e}")
-            st.stop()
-
+        cur = get_stock(picked_barcode)
         s1, s2, s3 = st.columns(3)
         with s1:
             closed_edit = st.number_input("Unopened (closed) boxes", value=int(cur["closed_boxes"]), step=1)
@@ -363,27 +354,16 @@ with tab3:
             sixpk_edit = st.number_input("6-packs", value=int(cur["sixpk"]), step=1)
 
         if st.button("Update Stock Snapshot"):
-            try:
-                set_stock(picked_barcode, int(closed_edit), int(singles_edit), int(sixpk_edit))
-                st.success("Stock updated.")
-            except Exception as e:
-                st.error(f"Failed to update stock: {e}")
+            set_stock(picked_barcode, int(closed_edit), int(singles_edit), int(sixpk_edit))
+            st.success("Stock updated.")
 
 
-# -----------------------------
-# Tab 1: Daily Entry
-# -----------------------------
 with tab1:
     st.subheader("Log daily openings")
 
     products = read_df(
-        """
-        select barcode, description, split_mode, pack_size
-        from products
-        order by description;
-        """
+        "select barcode, description, split_mode, pack_size from products order by description;"
     )
-
     if products.empty:
         st.info("Add products first in ‘Add / Edit Products’.")
     else:
@@ -403,7 +383,6 @@ with tab1:
         split_mode = picked["split_mode"]
         pack_size = int(picked["pack_size"]) if not pd.isna(picked["pack_size"]) else 0
 
-        # Current snapshot (before saving)
         cur = get_stock(barcode)
         st.caption("Current stock snapshot (before saving):")
         m1, m2, m3 = st.columns(3)
@@ -414,24 +393,23 @@ with tab1:
         singles_made = 0
         sixpk_made = 0
         if split_mode == "MANUAL":
-            st.info("Manual mode: enter singles and 6-packs made for this entry (e.g., sodas).")
+            st.info("Manual mode: enter singles and 6-packs made for this entry.")
             c1, c2 = st.columns(2)
             with c1:
                 singles_made = st.number_input("Singles made (manual)", min_value=0, value=0, step=1)
             with c2:
                 sixpk_made = st.number_input("6-packs made (manual)", min_value=0, value=0, step=1)
         elif split_mode == "AUTO":
-            st.success("Auto mode: singles/6pk are calculated automatically based on product settings.")
+            st.success("Auto mode: singles/6pk are calculated automatically.")
         else:
             st.warning("No-split mode: only unopened boxes will be reduced.")
 
         note = st.text_input("Note (optional)", "")
 
-        # Optional validation (MANUAL)
         validate = st.checkbox("Validate manual split (requires pack size)", value=False)
         if validate and split_mode == "MANUAL":
             if pack_size <= 0:
-                st.error("Pack size missing for this product. Add pack size in Add/Edit Products.")
+                st.error("Pack size missing for this product. Add it in Add/Edit Products.")
             else:
                 max_units = pack_size * int(boxes_opened)
                 used_units = int(singles_made) + int(sixpk_made) * 6
@@ -440,52 +418,29 @@ with tab1:
                 else:
                     st.caption(f"Manual units used: {used_units} / {max_units}")
 
-        # Save entry + show unopened boxes remaining
         if st.button("Save Daily Entry", type="primary"):
-            try:
-                res = apply_opening(
-                    log_date=log_date,
-                    barcode=barcode,
-                    boxes_opened=int(boxes_opened),
-                    singles_made=int(singles_made),
-                    sixpk_made=int(sixpk_made),
-                    note=note,
-                )
+            res = apply_opening(log_date, barcode, int(boxes_opened), int(singles_made), int(sixpk_made), note)
+            st.success(
+                f"Saved ✅ Unopened boxes still in stock for **{res['description']}**: **{res['new_closed_boxes']}**"
+            )
+            a1, a2, a3 = st.columns(3)
+            a1.metric("Unopened boxes (after save)", int(res["new_closed_boxes"]))
+            a2.metric("Singles (after save)", int(res["new_singles"]))
+            a3.metric("6-packs (after save)", int(res["new_sixpk"]))
+            st.caption(
+                f"Added from this entry → Singles: {int(res['derived_singles'])}, "
+                f"6-packs: {int(res['derived_sixpk'])} (mode: {res['split_mode']})"
+            )
 
-                st.success(
-                    f"Saved ✅ Unopened boxes still in stock for **{res['description']}**: "
-                    f"**{res['new_closed_boxes']}**"
-                )
-
-                a1, a2, a3 = st.columns(3)
-                a1.metric("Unopened boxes (after save)", int(res["new_closed_boxes"]))
-                a2.metric("Singles (after save)", int(res["new_singles"]))
-                a3.metric("6-packs (after save)", int(res["new_sixpk"]))
-
-                st.caption(
-                    f"Added from this entry → Singles: {int(res['derived_singles'])}, "
-                    f"6-packs: {int(res['derived_sixpk'])} (mode: {res['split_mode']})"
-                )
-
-            except Exception as e:
-                st.error(f"Failed to save: {e}")
-
-        # Undo last entry
         if st.button("Undo last entry"):
-            try:
-                ok, meta = undo_last_entry()
-                if ok:
-                    st.success(
-                        f"Undid last entry ✅ {meta['description']} unopened boxes now: {meta['new_closed_boxes']}"
-                    )
-                else:
-                    st.info("No entries to undo.")
-            except Exception as e:
-                st.error(f"Undo failed: {e}")
+            ok, meta = undo_last_entry()
+            if ok:
+                st.success(f"Undid last entry ✅ {meta['description']} unopened boxes now: {meta['new_closed_boxes']}")
+            else:
+                st.info("No entries to undo.")
 
         st.divider()
         st.subheader("Entries for selected date")
-
         day_df = read_df(
             """
             select l.id, l.log_date, p.description, l.barcode, l.boxes_opened, l.singles_made, l.sixpk_made, l.note, l.created_at
@@ -499,9 +454,6 @@ with tab1:
         st.dataframe(day_df, use_container_width=True)
 
 
-# -----------------------------
-# Tab 2: Dashboard
-# -----------------------------
 with tab2:
     st.subheader("Current stock position (live)")
 
@@ -515,7 +467,7 @@ with tab2:
           coalesce(s.closed_boxes, 0) as unopened_boxes,
           coalesce(s.singles, 0) as singles,
           coalesce(s.sixpk, 0) as sixpk,
-          (coalesce(s.singles, 0) + coalesce(s.sixpk, 0) * 6 + coalesce(s.closed_boxes, 0) * coalesce(p.pack_size, 0)) as total_units_equiv,
+          (coalesce(s.singles, 0) + coalesce(s.sixpk, 0)*6 + coalesce(s.closed_boxes, 0)*coalesce(p.pack_size, 0)) as total_units_equiv,
           coalesce(s.updated_at, now()) as updated_at
         from products p
         left join stock s on s.barcode = p.barcode
@@ -537,9 +489,7 @@ with tab2:
         st.divider()
         st.subheader("Low stock alerts (unopened boxes)")
         threshold = st.number_input("Low threshold (unopened boxes)", min_value=0, value=2, step=1)
-        low = pos[pos["unopened_boxes"] <= threshold][
-            ["description", "barcode", "unopened_boxes", "split_mode"]
-        ]
+        low = pos[pos["unopened_boxes"] <= threshold][["description", "barcode", "unopened_boxes", "split_mode"]]
         if low.empty:
             st.success("No low-stock items at this threshold.")
         else:
@@ -548,17 +498,10 @@ with tab2:
 
         st.divider()
         st.subheader("Export")
-
         c1, c2 = st.columns(2)
         with c1:
             csv_pos = pos.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "Download stock_position.csv",
-                data=csv_pos,
-                file_name="stock_position.csv",
-                mime="text/csv",
-            )
-
+            st.download_button("Download stock_position.csv", data=csv_pos, file_name="stock_position.csv", mime="text/csv")
         with c2:
             logs = read_df(
                 """
@@ -569,9 +512,4 @@ with tab2:
                 """
             )
             csv_logs = logs.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "Download open_log.csv",
-                data=csv_logs,
-                file_name="open_log.csv",
-                mime="text/csv",
-            )
+            st.download_button("Download open_log.csv", data=csv_logs, file_name="open_log.csv", mime="text/csv")
