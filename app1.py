@@ -1,64 +1,51 @@
+# app.py
+# Pack Split Tracker (Supabase/Postgres - Pooler-friendly)
+# - Uses DATABASE_URL from Streamlit Secrets (recommended for Streamlit Cloud)
+# - Works with Supabase Session Pooler / PgBouncer connection strings
+# - Tables: products, stock, open_log (auto-created if missing)
+# - Features:
+#   * Add/Edit products (AUTO / MANUAL / NONE)
+#   * Set/correct current stock snapshot
+#   * Daily entry logging (boxes opened + optional manual singles/6pk)
+#   * After save: show unopened boxes still in stock
+#   * Undo last entry
+#   * Dashboard with totals + low stock alerts + exports
+
 import os
-import socket
-from urllib.parse import urlparse, unquote
 from datetime import date
 
 import pandas as pd
 import streamlit as st
 import psycopg2
-from psycopg2.extras import RealDictCursor, execute_values
+from psycopg2.extras import RealDictCursor
 
 
 # -----------------------------
-# Config
+# App config
 # -----------------------------
 st.set_page_config(page_title="Pack Split Tracker (Supabase)", layout="wide")
 
 
 # -----------------------------
-# DB Connection (IPv4-safe)
+# DB connection (Pooler friendly)
 # -----------------------------
 def _get_database_url() -> str:
+    # Streamlit Secrets first, then env var
     if "DATABASE_URL" in st.secrets:
         return st.secrets["DATABASE_URL"]
-    env = os.getenv("DATABASE_URL", "")
-    return env
+    return os.getenv("DATABASE_URL", "")
 
 
 @st.cache_resource(show_spinner=False)
 def get_conn():
     db_url = _get_database_url()
     if not db_url:
-        raise RuntimeError("DATABASE_URL is not set in Streamlit secrets or environment.")
+        raise RuntimeError("DATABASE_URL is not set. Add it in Streamlit Secrets as DATABASE_URL.")
 
-    u = urlparse(db_url)
-
-    if u.scheme not in ("postgres", "postgresql"):
-        raise RuntimeError("DATABASE_URL must start with postgresql:// or postgres://")
-
-    host = u.hostname
-    port = u.port or 5432
-    user = unquote(u.username or "")
-    password = unquote(u.password or "")
-    dbname = (u.path or "").lstrip("/") or "postgres"
-
-    if not host or not user:
-        raise RuntimeError("DATABASE_URL is missing host or user.")
-
-    # Force IPv4 to avoid Streamlit Cloud IPv6 routing issues.
-    try:
-        hostaddr = socket.gethostbyname(host)  # returns IPv4 A record
-    except Exception as e:
-        raise RuntimeError(f"Failed to resolve IPv4 for host '{host}': {e}")
-
-    # NOTE: host is still passed for TLS/SNI; hostaddr is used for actual network connection.
+    # Pooler/session pooler connection strings work here as-is.
+    # sslmode=require is needed for Supabase.
     conn = psycopg2.connect(
-        dbname=dbname,
-        user=user,
-        password=password,
-        host=host,
-        hostaddr=hostaddr,
-        port=port,
+        db_url,
         sslmode="require",
         connect_timeout=10,
         cursor_factory=RealDictCursor,
@@ -90,7 +77,7 @@ def read_df(sql: str, params=None) -> pd.DataFrame:
 
 
 def init_db():
-    # Safe to run every time
+    # Safe to run on every start
     execute(
         """
         create table if not exists products (
@@ -104,6 +91,7 @@ def init_db():
         );
         """
     )
+
     execute(
         """
         create table if not exists stock (
@@ -115,6 +103,7 @@ def init_db():
         );
         """
     )
+
     execute(
         """
         create table if not exists open_log (
@@ -129,10 +118,14 @@ def init_db():
         );
         """
     )
+
     execute("create index if not exists idx_open_log_date on open_log(log_date);")
     execute("create index if not exists idx_open_log_barcode on open_log(barcode);")
 
 
+# -----------------------------
+# Domain logic
+# -----------------------------
 def ensure_stock_row(barcode: str):
     execute(
         """
@@ -144,7 +137,14 @@ def ensure_stock_row(barcode: str):
     )
 
 
-def upsert_product(barcode: str, description: str, pack_size, split_mode: str, auto_singles: int, auto_sixpk: int):
+def upsert_product(
+    barcode: str,
+    description: str,
+    pack_size,
+    split_mode: str,
+    auto_singles: int,
+    auto_sixpk: int,
+):
     execute(
         """
         insert into products (barcode, description, pack_size, split_mode, auto_singles_per_box, auto_sixpk_per_box)
@@ -189,7 +189,14 @@ def set_stock(barcode: str, closed_boxes: int, singles: int, sixpk: int):
     )
 
 
-def apply_opening(log_date: date, barcode: str, boxes_opened: int, singles_made: int, sixpk_made: int, note: str = ""):
+def apply_opening(
+    log_date: date,
+    barcode: str,
+    boxes_opened: int,
+    singles_made: int,
+    sixpk_made: int,
+    note: str = "",
+):
     prod = get_product(barcode)
     stk = get_stock(barcode)
 
@@ -198,6 +205,7 @@ def apply_opening(log_date: date, barcode: str, boxes_opened: int, singles_made:
 
     split_mode = prod["split_mode"]
 
+    # Derive what gets added to singles/sixpk based on split mode
     if split_mode == "AUTO":
         derived_singles = boxes_opened * int(prod.get("auto_singles_per_box") or 0)
         derived_sixpk = boxes_opened * int(prod.get("auto_sixpk_per_box") or 0)
@@ -208,7 +216,7 @@ def apply_opening(log_date: date, barcode: str, boxes_opened: int, singles_made:
         derived_sixpk = int(sixpk_made or 0)
         singles_to_store = derived_singles
         sixpk_to_store = derived_sixpk
-    else:
+    else:  # NONE
         derived_singles = 0
         derived_sixpk = 0
         singles_to_store = 0
@@ -218,6 +226,7 @@ def apply_opening(log_date: date, barcode: str, boxes_opened: int, singles_made:
     new_singles = int(stk["singles"]) + int(derived_singles)
     new_sixpk = int(stk["sixpk"]) + int(derived_sixpk)
 
+    # Persist log
     execute(
         """
         insert into open_log (log_date, barcode, boxes_opened, singles_made, sixpk_made, note)
@@ -226,6 +235,7 @@ def apply_opening(log_date: date, barcode: str, boxes_opened: int, singles_made:
         (log_date, barcode, boxes_opened, singles_to_store, sixpk_to_store, note or ""),
     )
 
+    # Update current snapshot
     set_stock(barcode, new_closed, new_singles, new_sixpk)
 
     return {
@@ -294,6 +304,7 @@ except Exception as e:
 tab1, tab2, tab3 = st.tabs(["✅ Daily Entry", "📊 Dashboard", "➕ Add / Edit Products"])
 
 
+# -------- Tab 3: Add/Edit + Stock snapshot --------
 with tab3:
     st.subheader("Add / Edit a product")
 
@@ -358,12 +369,11 @@ with tab3:
             st.success("Stock updated.")
 
 
+# -------- Tab 1: Daily entry --------
 with tab1:
     st.subheader("Log daily openings")
 
-    products = read_df(
-        "select barcode, description, split_mode, pack_size from products order by description;"
-    )
+    products = read_df("select barcode, description, split_mode, pack_size from products order by description;")
     if products.empty:
         st.info("Add products first in ‘Add / Edit Products’.")
     else:
@@ -383,6 +393,7 @@ with tab1:
         split_mode = picked["split_mode"]
         pack_size = int(picked["pack_size"]) if not pd.isna(picked["pack_size"]) else 0
 
+        # Snapshot (before saving)
         cur = get_stock(barcode)
         st.caption("Current stock snapshot (before saving):")
         m1, m2, m3 = st.columns(3)
@@ -406,10 +417,11 @@ with tab1:
 
         note = st.text_input("Note (optional)", "")
 
+        # Optional validation for MANUAL mode
         validate = st.checkbox("Validate manual split (requires pack size)", value=False)
         if validate and split_mode == "MANUAL":
             if pack_size <= 0:
-                st.error("Pack size missing for this product. Add it in Add/Edit Products.")
+                st.error("Pack size missing for this product. Add pack size in Add/Edit Products.")
             else:
                 max_units = pack_size * int(boxes_opened)
                 used_units = int(singles_made) + int(sixpk_made) * 6
@@ -419,7 +431,14 @@ with tab1:
                     st.caption(f"Manual units used: {used_units} / {max_units}")
 
         if st.button("Save Daily Entry", type="primary"):
-            res = apply_opening(log_date, barcode, int(boxes_opened), int(singles_made), int(sixpk_made), note)
+            res = apply_opening(
+                log_date=log_date,
+                barcode=barcode,
+                boxes_opened=int(boxes_opened),
+                singles_made=int(singles_made),
+                sixpk_made=int(sixpk_made),
+                note=note,
+            )
             st.success(
                 f"Saved ✅ Unopened boxes still in stock for **{res['description']}**: **{res['new_closed_boxes']}**"
             )
@@ -454,6 +473,7 @@ with tab1:
         st.dataframe(day_df, use_container_width=True)
 
 
+# -------- Tab 2: Dashboard --------
 with tab2:
     st.subheader("Current stock position (live)")
 
@@ -498,10 +518,16 @@ with tab2:
 
         st.divider()
         st.subheader("Export")
+
         c1, c2 = st.columns(2)
         with c1:
             csv_pos = pos.to_csv(index=False).encode("utf-8")
-            st.download_button("Download stock_position.csv", data=csv_pos, file_name="stock_position.csv", mime="text/csv")
+            st.download_button(
+                "Download stock_position.csv",
+                data=csv_pos,
+                file_name="stock_position.csv",
+                mime="text/csv",
+            )
         with c2:
             logs = read_df(
                 """
@@ -512,4 +538,9 @@ with tab2:
                 """
             )
             csv_logs = logs.to_csv(index=False).encode("utf-8")
-            st.download_button("Download open_log.csv", data=csv_logs, file_name="open_log.csv", mime="text/csv")
+            st.download_button(
+                "Download open_log.csv",
+                data=csv_logs,
+                file_name="open_log.csv",
+                mime="text/csv",
+            )
