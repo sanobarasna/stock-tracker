@@ -3,7 +3,9 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
-# Get connection from secrets
+# -----------------------------
+# DB CONFIG (Supabase secrets)
+# -----------------------------
 DB_CONFIG = {
     "host": st.secrets["supabase"]["host"],
     "port": st.secrets["supabase"]["port"],
@@ -12,7 +14,9 @@ DB_CONFIG = {
     "password": st.secrets["supabase"]["password"],
 }
 
-# Connection pool
+# -----------------------------
+# Connection (cached)
+# -----------------------------
 @st.cache_resource
 def get_conn():
     return psycopg2.connect(**DB_CONFIG)
@@ -28,36 +32,48 @@ def execute_query(query, params=None):
     conn.commit()
     cur.close()
 
+# -----------------------------
+# Data helpers
+# -----------------------------
 def ensure_stock_row(barcode: str):
-    execute_query("""
-    INSERT INTO stock (barcode, closed_boxes, singles, sixpk)
-    VALUES (%s, 0, 0, 0)
-    ON CONFLICT(barcode) DO NOTHING;
-    """, (barcode,))
+    execute_query(
+        """
+        INSERT INTO stock (barcode, closed_boxes, singles, sixpk)
+        VALUES (%s, 0, 0, 0)
+        ON CONFLICT(barcode) DO NOTHING;
+        """,
+        (barcode,),
+    )
 
 def upsert_product(barcode, description, pack_size, split_mode, auto_singles, auto_sixpk):
-    execute_query("""
-    INSERT INTO products (barcode, description, pack_size, split_mode, auto_singles_per_box, auto_sixpk_per_box)
-    VALUES (%s, %s, %s, %s, %s, %s)
-    ON CONFLICT(barcode) DO UPDATE SET
-        description=EXCLUDED.description,
-        pack_size=EXCLUDED.pack_size,
-        split_mode=EXCLUDED.split_mode,
-        auto_singles_per_box=EXCLUDED.auto_singles_per_box,
-        auto_sixpk_per_box=EXCLUDED.auto_sixpk_per_box;
-    """, (barcode, description, pack_size, split_mode, auto_singles, auto_sixpk))
+    execute_query(
+        """
+        INSERT INTO products (barcode, description, pack_size, split_mode, auto_singles_per_box, auto_sixpk_per_box)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT(barcode) DO UPDATE SET
+            description=EXCLUDED.description,
+            pack_size=EXCLUDED.pack_size,
+            split_mode=EXCLUDED.split_mode,
+            auto_singles_per_box=EXCLUDED.auto_singles_per_box,
+            auto_sixpk_per_box=EXCLUDED.auto_sixpk_per_box;
+        """,
+        (barcode, description, pack_size, split_mode, auto_singles, auto_sixpk),
+    )
     ensure_stock_row(barcode)
 
 def set_stock(barcode, closed_boxes, singles, sixpk):
-    execute_query("""
-    INSERT INTO stock (barcode, closed_boxes, singles, sixpk, updated_at)
-    VALUES (%s, %s, %s, %s, NOW())
-    ON CONFLICT(barcode) DO UPDATE SET
-        closed_boxes=EXCLUDED.closed_boxes,
-        singles=EXCLUDED.singles,
-        sixpk=EXCLUDED.sixpk,
-        updated_at=NOW();
-    """, (barcode, closed_boxes, singles, sixpk))
+    execute_query(
+        """
+        INSERT INTO stock (barcode, closed_boxes, singles, sixpk, updated_at)
+        VALUES (%s, %s, %s, %s, NOW())
+        ON CONFLICT(barcode) DO UPDATE SET
+            closed_boxes=EXCLUDED.closed_boxes,
+            singles=EXCLUDED.singles,
+            sixpk=EXCLUDED.sixpk,
+            updated_at=NOW();
+        """,
+        (barcode, closed_boxes, singles, sixpk),
+    )
 
 def get_product(barcode: str) -> dict:
     df = read_df("SELECT * FROM products WHERE barcode=%s", (barcode,))
@@ -99,10 +115,20 @@ def apply_opening(log_date, barcode, boxes_opened, singles_made, sixpk_made, not
     new_singles = int(stk["singles"]) + int(derived_singles)
     new_sixpk = int(stk["sixpk"]) + int(derived_sixpk)
 
-    execute_query("""
-    INSERT INTO open_log (log_date, barcode, boxes_opened, singles_made, sixpk_made, note)
-    VALUES (%s, %s, %s, %s, %s, %s)
-    """, (str(log_date), barcode, int(boxes_opened), singles_made_to_store, sixpk_made_to_store, note or ""))
+    execute_query(
+        """
+        INSERT INTO open_log (log_date, barcode, boxes_opened, singles_made, sixpk_made, note)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """,
+        (
+            str(log_date),
+            barcode,
+            int(boxes_opened),
+            singles_made_to_store,
+            sixpk_made_to_store,
+            note or "",
+        ),
+    )
 
     set_stock(barcode, new_closed, new_singles, new_sixpk)
 
@@ -150,13 +176,38 @@ def undo_last_entry():
 
     return True, {"barcode": barcode, "new_closed_boxes": new_closed}
 
-# UI
-st.set_page_config(page_title="Pack Split Tracker", layout="wide")
+# -----------------------------
+# UI helpers (NEW)
+# -----------------------------
+STOCK_CLOSED_KEY = "stock_closed"
+STOCK_SINGLES_KEY = "stock_singles"
+STOCK_SIXPK_KEY = "stock_sixpk"
+STOCK_PICK_KEY = "stock_pick_product"
 
+def _load_stock_into_inputs(barcode: str):
+    """When product changes, preload the inputs to current DB stock."""
+    cur = get_stock(barcode)
+    st.session_state[STOCK_CLOSED_KEY] = int(cur["closed_boxes"])
+    st.session_state[STOCK_SINGLES_KEY] = int(cur["singles"])
+    st.session_state[STOCK_SIXPK_KEY] = int(cur["sixpk"])
+
+def _reset_stock_inputs_to_zero():
+    """After Update Stock Snapshot, reset inputs back to 0 (your requested behavior)."""
+    st.session_state[STOCK_CLOSED_KEY] = 0
+    st.session_state[STOCK_SINGLES_KEY] = 0
+    st.session_state[STOCK_SIXPK_KEY] = 0
+
+# -----------------------------
+# PAGE
+# -----------------------------
+st.set_page_config(page_title="Pack Split Tracker", layout="wide")
 st.title("📦 Pack Split Tracker (Daily Boxes → Singles & 6-Packs)")
 
 tab1, tab2, tab3 = st.tabs(["✅ Daily Entry", "📊 Dashboard", "➕ Add / Edit Products"])
 
+# -----------------------------
+# TAB 3: Products + Stock fix
+# -----------------------------
 with tab3:
     st.subheader("Add / Edit a product")
 
@@ -190,45 +241,71 @@ with tab3:
                 int(pack_size) if pack_size else None,
                 split_mode,
                 int(auto_singles),
-                int(auto_sixpk)
+                int(auto_sixpk),
             )
             st.success("Saved product!")
             st.rerun()
 
     st.divider()
     st.subheader("Set / correct current stock (optional but recommended)")
+
     products = read_df("SELECT barcode, description FROM products ORDER BY description")
     if products.empty:
         st.warning("No products yet. Add products first.")
     else:
+        # Select product (with on_change to preload inputs)
         pick = st.selectbox(
             "Pick product",
             products["barcode"].tolist(),
-            format_func=lambda b: f"{products.loc[products['barcode']==b,'description'].iloc[0]} ({b})"
+            key=STOCK_PICK_KEY,
+            on_change=lambda: _load_stock_into_inputs(st.session_state[STOCK_PICK_KEY]),
+            format_func=lambda b: f"{products.loc[products['barcode']==b,'description'].iloc[0]} ({b})",
         )
 
-        cur = get_stock(pick)
+        # First load when page opens (if inputs not set yet)
+        if STOCK_CLOSED_KEY not in st.session_state:
+            _load_stock_into_inputs(pick)
+
+        # Show current stock snapshot from DB (separate from editable inputs)
+        cur_db = get_stock(pick)
+
+        st.caption("Current stock in DB (right now):")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Unopened boxes (DB)", int(cur_db["closed_boxes"]))
+        m2.metric("Singles (DB)", int(cur_db["singles"]))
+        m3.metric("6-packs (DB)", int(cur_db["sixpk"]))
+
+        # Editable inputs (WITH KEYS)
         c1, c2, c3 = st.columns(3)
         with c1:
-            closed = st.number_input("Unopened (closed) boxes", value=int(cur["closed_boxes"]), step=1)
+            closed = st.number_input("Unopened (closed) boxes", step=1, key=STOCK_CLOSED_KEY)
         with c2:
-            singles = st.number_input("Singles", value=int(cur["singles"]), step=1)
+            singles = st.number_input("Singles", step=1, key=STOCK_SINGLES_KEY)
         with c3:
-            sixpk = st.number_input("6-packs", value=int(cur["sixpk"]), step=1)
+            sixpk = st.number_input("6-packs", step=1, key=STOCK_SIXPK_KEY)
 
         if st.button("Update Stock Snapshot"):
             set_stock(pick, int(closed), int(singles), int(sixpk))
+
+            # ✅ REQUIRED CHANGE: reset inputs to 0 after update
+            _reset_stock_inputs_to_zero()
+
             st.success("Stock updated.")
             st.rerun()
 
+# -----------------------------
+# TAB 1: Daily Entry
+# -----------------------------
 with tab1:
     st.subheader("Log today's openings")
 
-    products = read_df("""
+    products = read_df(
+        """
         SELECT p.barcode, p.description, p.split_mode, p.pack_size
         FROM products p
         ORDER BY p.description
-    """)
+        """
+    )
 
     if products.empty:
         st.warning("Add products first in the 'Add / Edit Products' tab.")
@@ -240,7 +317,7 @@ with tab1:
             barcode = st.selectbox(
                 "Product",
                 products["barcode"].tolist(),
-                format_func=lambda b: f"{products.loc[products['barcode']==b,'description'].iloc[0]} ({b})"
+                format_func=lambda b: f"{products.loc[products['barcode']==b,'description'].iloc[0]} ({b})",
             )
         with col3:
             boxes_opened = st.number_input("Boxes opened", min_value=0, value=0, step=1)
@@ -293,7 +370,7 @@ with tab1:
                     int(boxes_opened),
                     int(singles_made),
                     int(sixpk_made),
-                    note
+                    note,
                 )
 
                 st.success(
@@ -326,22 +403,29 @@ with tab1:
 
         st.divider()
         st.subheader("Entries for selected date")
-        day_df = read_df("""
+        day_df = read_df(
+            """
             SELECT l.id, l.log_date, p.description, l.barcode, l.boxes_opened, l.singles_made, l.sixpk_made, l.note
             FROM open_log l
             JOIN products p ON p.barcode = l.barcode
             WHERE l.log_date = %s
             ORDER BY l.id DESC
-        """, (str(log_date),))
+            """,
+            (str(log_date),),
+        )
         if not day_df.empty:
             st.dataframe(day_df, use_container_width=True)
         else:
             st.info("No entries for this date.")
 
+# -----------------------------
+# TAB 2: Dashboard
+# -----------------------------
 with tab2:
     st.subheader("Current stock position (live)")
 
-    pos = read_df("""
+    pos = read_df(
+        """
         SELECT
             p.description,
             p.barcode,
@@ -354,7 +438,8 @@ with tab2:
         FROM products p
         LEFT JOIN stock s ON s.barcode = p.barcode
         ORDER BY p.description
-    """)
+        """
+    )
 
     if pos.empty:
         st.info("No data yet.")
@@ -381,4 +466,9 @@ with tab2:
         st.subheader("Export")
         export = pos.copy()
         csv = export.to_csv(index=False).encode("utf-8")
-        st.download_button("Download stock_position.csv", data=csv, file_name="stock_position.csv", mime="text/csv")
+        st.download_button(
+            "Download stock_position.csv",
+            data=csv,
+            file_name="stock_position.csv",
+            mime="text/csv",
+        )
