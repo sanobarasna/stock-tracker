@@ -1,10 +1,3 @@
-# app.py
-# Pack Split Tracker (Supabase/Postgres - Session Pooler friendly)
-# - Opens/closes DB connection per query (best for Supabase Pooler)
-# - FK-safe stock creation
-# - Filters bad products (e.g., barcode='barcode', blank barcode/description)
-# - Clean dropdown labels
-
 import os
 from datetime import date
 
@@ -12,7 +5,6 @@ import pandas as pd
 import streamlit as st
 import psycopg2
 from psycopg2.extras import RealDictCursor
-
 
 st.set_page_config(page_title="Pack Split Tracker (Supabase)", layout="wide")
 
@@ -70,7 +62,6 @@ def init_db():
         );
         """
     )
-
     execute(
         """
         create table if not exists stock (
@@ -82,7 +73,6 @@ def init_db():
         );
         """
     )
-
     execute(
         """
         create table if not exists open_log (
@@ -97,42 +87,47 @@ def init_db():
         );
         """
     )
-
     execute("create index if not exists idx_open_log_date on open_log(log_date);")
     execute("create index if not exists idx_open_log_barcode on open_log(barcode);")
 
 
 # -----------------------------
-# Data cleaning for UI lists
+# Product dataframe cleaning (robust)
 # -----------------------------
+def _safe_str_series(s: pd.Series) -> pd.Series:
+    # Handles ints, floats, None; keeps real values; strips whitespace
+    return s.apply(lambda x: "" if x is None else str(x)).str.strip()
+
+
 def _clean_products_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
+    if df is None or df.empty:
+        return pd.DataFrame(columns=df.columns if df is not None else [])
 
     df = df.copy()
-    df["barcode"] = df["barcode"].astype(str).str.strip()
-    df["description"] = df["description"].astype(str).str.strip()
+
+    # Ensure columns exist
+    if "barcode" not in df.columns or "description" not in df.columns:
+        return df.iloc[0:0]
+
+    df["barcode"] = _safe_str_series(df["barcode"])
+    df["description"] = _safe_str_series(df["description"])
 
     # Remove header-like / blank junk
     df = df[
-        (df["barcode"].notna())
-        & (df["description"].notna())
-        & (df["barcode"] != "")
+        (df["barcode"] != "")
         & (df["description"] != "")
         & (df["barcode"].str.lower() != "barcode")
         & (df["description"].str.lower() != "description")
     ]
 
-    # Remove duplicates (keep first)
+    # Remove duplicates by barcode
     df = df.drop_duplicates(subset=["barcode"], keep="first")
 
     return df
 
 
 def load_products_min() -> pd.DataFrame:
-    df = read_df(
-        "select barcode, description, split_mode, pack_size from products order by description;"
-    )
+    df = read_df("select barcode, description, split_mode, pack_size from products order by description;")
     return _clean_products_df(df)
 
 
@@ -150,7 +145,6 @@ def product_exists(barcode: str) -> bool:
 
 
 def ensure_stock_row(barcode: str):
-    # FK-safe: only insert if product exists
     execute(
         """
         insert into stock (barcode, closed_boxes, singles, sixpk)
@@ -163,11 +157,27 @@ def ensure_stock_row(barcode: str):
     )
 
 
+def repair_all_stock_rows():
+    # Creates missing stock rows for ALL products (one-click repair)
+    execute(
+        """
+        insert into stock (barcode, closed_boxes, singles, sixpk)
+        select p.barcode, 0, 0, 0
+        from products p
+        left join stock s on s.barcode = p.barcode
+        where s.barcode is null;
+        """
+    )
+
+
 def upsert_product(barcode: str, description: str, pack_size, split_mode: str, auto_singles: int, auto_sixpk: int):
     barcode = (barcode or "").strip()
     description = (description or "").strip()
-    if not barcode or not description or barcode.lower() == "barcode" or description.lower() == "description":
-        raise ValueError("Invalid barcode/description. Please enter a real product barcode and description.")
+    if not barcode or not description:
+        raise ValueError("Barcode and Description are required.")
+
+    if barcode.lower() == "barcode" or description.lower() == "description":
+        raise ValueError("Invalid product (looks like a header row).")
 
     execute(
         """
@@ -195,12 +205,9 @@ def get_product(barcode: str) -> dict:
 def get_stock(barcode: str) -> dict:
     if not product_exists(barcode):
         raise ValueError(f"Stock requested for unknown product barcode: {barcode}")
-
     ensure_stock_row(barcode)
     row = execute("select * from stock where barcode=%s;", (barcode,), fetchone=True)
-    if not row:
-        return {"barcode": barcode, "closed_boxes": 0, "singles": 0, "sixpk": 0}
-    return dict(row)
+    return dict(row) if row else {"barcode": barcode, "closed_boxes": 0, "singles": 0, "sixpk": 0}
 
 
 def set_stock(barcode: str, closed_boxes: int, singles: int, sixpk: int):
@@ -303,13 +310,18 @@ def undo_last_entry():
     execute("delete from open_log where id=%s;", (row["id"],))
     set_stock(barcode, new_closed, new_singles, new_sixpk)
 
-    return True, {
-        "barcode": barcode,
-        "description": prod["description"],
-        "new_closed_boxes": new_closed,
-        "new_singles": new_singles,
-        "new_sixpk": new_sixpk,
-    }
+    return True, {"description": prod["description"], "new_closed_boxes": new_closed}
+
+
+def _safe_int(x) -> int:
+    try:
+        if x is None:
+            return 0
+        if pd.isna(x):
+            return 0
+        return int(x)
+    except Exception:
+        return 0
 
 
 # -----------------------------
@@ -342,7 +354,6 @@ with tab3:
     auto_singles_in = 0
     auto_sixpk_in = 0
     if split_mode_in == "AUTO":
-        st.info("AUTO = app calculates singles/6pk every time you open a box.")
         c1, c2 = st.columns(2)
         with c1:
             auto_singles_in = st.number_input("Auto singles per opened box", min_value=0, value=40, step=1)
@@ -364,31 +375,35 @@ with tab3:
             st.error(f"Save failed: {e}")
 
     st.divider()
+    st.subheader("Repair / initialize stock rows")
+    st.caption("If you migrated products but stock rows are missing, click this once.")
+    if st.button("Repair missing stock rows"):
+        try:
+            repair_all_stock_rows()
+            st.success("Repaired stock rows.")
+        except Exception as e:
+            st.error(f"Repair failed: {e}")
+
+    st.divider()
     st.subheader("Set / correct current stock snapshot")
 
     products_df = load_products_for_picker()
     if products_df.empty:
-        st.info("No valid products found. (If you migrated, run the cleanup SQL I sent.)")
+        st.info("No valid products found. (Your products exist, so this means they were loaded in a type that got filtered earlier — this code fixes that.)")
     else:
-        # Build a label map once
         label_map = {r["barcode"]: f"{r['description']} ({r['barcode']})" for _, r in products_df.iterrows()}
         options = products_df["barcode"].tolist()
 
         picked_barcode = st.selectbox("Pick product", options, format_func=lambda b: label_map.get(b, b))
-
-        try:
-            cur = get_stock(picked_barcode)
-        except Exception as e:
-            st.error(f"Could not load stock for this product: {e}")
-            st.stop()
+        cur = get_stock(picked_barcode)
 
         s1, s2, s3 = st.columns(3)
         with s1:
-            closed_edit = st.number_input("Unopened (closed) boxes", value=int(cur["closed_boxes"]), step=1)
+            closed_edit = st.number_input("Unopened (closed) boxes", value=_safe_int(cur.get("closed_boxes")), step=1)
         with s2:
-            singles_edit = st.number_input("Singles", value=int(cur["singles"]), step=1)
+            singles_edit = st.number_input("Singles", value=_safe_int(cur.get("singles")), step=1)
         with s3:
-            sixpk_edit = st.number_input("6-packs", value=int(cur["sixpk"]), step=1)
+            sixpk_edit = st.number_input("6-packs", value=_safe_int(cur.get("sixpk")), step=1)
 
         if st.button("Update Stock Snapshot"):
             try:
@@ -403,7 +418,7 @@ with tab1:
 
     products = load_products_min()
     if products.empty:
-        st.info("No valid products found. Add products first in ‘Add / Edit Products’.")
+        st.info("No valid products found. Click **Repair missing stock rows** in Add/Edit tab, then refresh.")
     else:
         label_map = {r["barcode"]: f"{r['description']} ({r['barcode']})" for _, r in products.iterrows()}
         options = products["barcode"].tolist()
@@ -418,42 +433,31 @@ with tab1:
 
         picked = products[products["barcode"] == barcode].iloc[0]
         split_mode = picked["split_mode"]
-        pack_size = int(picked["pack_size"]) if not pd.isna(picked["pack_size"]) else 0
+        pack_size = _safe_int(picked["pack_size"])
 
         cur = get_stock(barcode)
-        st.caption("Current stock snapshot (before saving):")
         m1, m2, m3 = st.columns(3)
-        m1.metric("Unopened boxes", int(cur["closed_boxes"]))
-        m2.metric("Singles", int(cur["singles"]))
-        m3.metric("6-packs", int(cur["sixpk"]))
+        m1.metric("Unopened boxes", _safe_int(cur.get("closed_boxes")))
+        m2.metric("Singles", _safe_int(cur.get("singles")))
+        m3.metric("6-packs", _safe_int(cur.get("sixpk")))
 
         singles_made = 0
         sixpk_made = 0
         if split_mode == "MANUAL":
-            st.info("Manual mode: enter singles and 6-packs made for this entry (sodas, etc.).")
             c1, c2 = st.columns(2)
             with c1:
                 singles_made = st.number_input("Singles made (manual)", min_value=0, value=0, step=1)
             with c2:
                 sixpk_made = st.number_input("6-packs made (manual)", min_value=0, value=0, step=1)
-        elif split_mode == "AUTO":
-            st.success("Auto mode: singles/6pk are calculated automatically.")
-        else:
-            st.warning("No-split mode: only unopened boxes will be reduced.")
 
         note = st.text_input("Note (optional)", "")
 
         validate = st.checkbox("Validate manual split (requires pack size)", value=False)
-        if validate and split_mode == "MANUAL":
-            if pack_size <= 0:
-                st.error("Pack size missing for this product. Add pack size in Add/Edit Products.")
-            else:
-                max_units = pack_size * int(boxes_opened)
-                used_units = int(singles_made) + int(sixpk_made) * 6
-                if used_units > max_units:
-                    st.error(f"You entered {used_units} units but {boxes_opened} box(es) max is {max_units}.")
-                else:
-                    st.caption(f"Manual units used: {used_units} / {max_units}")
+        if validate and split_mode == "MANUAL" and pack_size > 0:
+            max_units = pack_size * int(boxes_opened)
+            used_units = int(singles_made) + int(sixpk_made) * 6
+            if used_units > max_units:
+                st.error(f"You entered {used_units} units but {boxes_opened} box(es) max is {max_units}.")
 
         if st.button("Save Daily Entry", type="primary"):
             try:
@@ -463,17 +467,13 @@ with tab1:
                 st.error(f"Save failed: {e}")
 
         if st.button("Undo last entry"):
-            try:
-                ok, meta = undo_last_entry()
-                if ok:
-                    st.success(f"Undid last entry ✅ {meta['description']} unopened boxes now: {meta['new_closed_boxes']}")
-                else:
-                    st.info("No entries to undo.")
-            except Exception as e:
-                st.error(f"Undo failed: {e}")
+            ok, meta = undo_last_entry()
+            if ok:
+                st.success(f"Undid last entry ✅ {meta['description']} unopened boxes now: {meta['new_closed_boxes']}")
+            else:
+                st.info("No entries to undo.")
 
         st.divider()
-        st.subheader("Entries for selected date")
         day_df = read_df(
             """
             select l.id, l.log_date, p.description, l.barcode, l.boxes_opened, l.singles_made, l.sixpk_made, l.note, l.created_at
@@ -484,6 +484,7 @@ with tab1:
             """,
             (log_date,),
         )
+        st.subheader("Entries for selected date")
         st.dataframe(day_df, use_container_width=True)
 
 
@@ -511,48 +512,17 @@ with tab2:
     )
 
     if pos.empty:
-        st.info("No data yet.")
+        st.info("No stock rows yet. Go to Add/Edit tab and click **Repair missing stock rows**.")
     else:
+        unopened_total = _safe_int(pos["unopened_boxes"].sum())
+        singles_total = _safe_int(pos["singles"].sum())
+        sixpk_total = _safe_int(pos["sixpk"].sum())
+        units_total = _safe_int(pos["total_units_equiv"].sum())
+
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Total unopened boxes", int(pos["unopened_boxes"].sum()))
-        k2.metric("Total singles", int(pos["singles"].sum()))
-        k3.metric("Total 6-packs", int(pos["sixpk"].sum()))
-        k4.metric("Total units (equiv)", int(pos["total_units_equiv"].sum()))
+        k1.metric("Total unopened boxes", unopened_total)
+        k2.metric("Total singles", singles_total)
+        k3.metric("Total 6-packs", sixpk_total)
+        k4.metric("Total units (equiv)", units_total)
 
         st.dataframe(pos, use_container_width=True)
-
-        st.divider()
-        st.subheader("Low stock alerts (unopened boxes)")
-        threshold = st.number_input("Low threshold (unopened boxes)", min_value=0, value=2, step=1)
-        low = pos[pos["unopened_boxes"] <= threshold][["description", "barcode", "unopened_boxes", "split_mode"]]
-        if low.empty:
-            st.success("No low-stock items at this threshold.")
-        else:
-            st.warning("Items at/below threshold:")
-            st.dataframe(low, use_container_width=True)
-
-        st.divider()
-        st.subheader("Export")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.download_button(
-                "Download stock_position.csv",
-                data=pos.to_csv(index=False).encode("utf-8"),
-                file_name="stock_position.csv",
-                mime="text/csv",
-            )
-        with c2:
-            logs = read_df(
-                """
-                select l.id, l.log_date, p.description, l.barcode, l.boxes_opened, l.singles_made, l.sixpk_made, l.note, l.created_at
-                from open_log l
-                join products p on p.barcode = l.barcode
-                order by l.id desc;
-                """
-            )
-            st.download_button(
-                "Download open_log.csv",
-                data=logs.to_csv(index=False).encode("utf-8"),
-                file_name="open_log.csv",
-                mime="text/csv",
-            )
