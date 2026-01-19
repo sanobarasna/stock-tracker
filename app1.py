@@ -18,15 +18,30 @@ def _get_database_url() -> str:
     return os.getenv("DATABASE_URL", "")
 
 
+def _redact_db_url(url: str) -> str:
+    # show host/port/db, hide password
+    try:
+        # postgresql://user:pass@host:port/db
+        left, right = url.split("://", 1)
+        creds, rest = right.split("@", 1)
+        user = creds.split(":", 1)[0]
+        return f"{left}://{user}:***@{rest}"
+    except Exception:
+        return "Could not parse DATABASE_URL (but it is set)."
+
+
 def _connect():
     db_url = _get_database_url()
     if not db_url:
         raise RuntimeError("DATABASE_URL is not set in Streamlit Secrets.")
+
+    # Force search_path to public so we always read/write the same schema
     return psycopg2.connect(
         db_url,
         sslmode="require",
         connect_timeout=10,
         cursor_factory=RealDictCursor,
+        options="-c search_path=public",
     )
 
 
@@ -51,7 +66,7 @@ def read_df(sql: str, params=None) -> pd.DataFrame:
 def init_db():
     execute(
         """
-        create table if not exists products (
+        create table if not exists public.products (
           barcode text primary key,
           description text not null,
           pack_size int,
@@ -62,10 +77,11 @@ def init_db():
         );
         """
     )
+
     execute(
         """
-        create table if not exists stock (
-          barcode text primary key references products(barcode) on delete cascade,
+        create table if not exists public.stock (
+          barcode text primary key references public.products(barcode) on delete cascade,
           closed_boxes int not null default 0,
           singles int not null default 0,
           sixpk int not null default 0,
@@ -73,12 +89,13 @@ def init_db():
         );
         """
     )
+
     execute(
         """
-        create table if not exists open_log (
+        create table if not exists public.open_log (
           id bigserial primary key,
           log_date date not null,
-          barcode text not null references products(barcode) on delete cascade,
+          barcode text not null references public.products(barcode) on delete cascade,
           boxes_opened int not null check (boxes_opened >= 0),
           singles_made int not null default 0,
           sixpk_made int not null default 0,
@@ -87,69 +104,61 @@ def init_db():
         );
         """
     )
-    execute("create index if not exists idx_open_log_date on open_log(log_date);")
-    execute("create index if not exists idx_open_log_barcode on open_log(barcode);")
+
+    execute("create index if not exists idx_open_log_date on public.open_log(log_date);")
+    execute("create index if not exists idx_open_log_barcode on public.open_log(barcode);")
 
 
 # -----------------------------
-# Product dataframe cleaning (robust)
+# Cleanup + repair (the fix)
 # -----------------------------
-def _safe_str_series(s: pd.Series) -> pd.Series:
-    # Handles ints, floats, None; keeps real values; strips whitespace
-    return s.apply(lambda x: "" if x is None else str(x)).str.strip()
-
-
-def _clean_products_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=df.columns if df is not None else [])
-
-    df = df.copy()
-
-    # Ensure columns exist
-    if "barcode" not in df.columns or "description" not in df.columns:
-        return df.iloc[0:0]
-
-    df["barcode"] = _safe_str_series(df["barcode"])
-    df["description"] = _safe_str_series(df["description"])
-
-    # Remove header-like / blank junk
-    df = df[
-        (df["barcode"] != "")
-        & (df["description"] != "")
-        & (df["barcode"].str.lower() != "barcode")
-        & (df["description"].str.lower() != "description")
-    ]
-
-    # Remove duplicates by barcode
-    df = df.drop_duplicates(subset=["barcode"], keep="first")
-
-    return df
-
-
-def load_products_min() -> pd.DataFrame:
-    df = read_df("select barcode, description, split_mode, pack_size from products order by description;")
-    return _clean_products_df(df)
-
-
-def load_products_for_picker() -> pd.DataFrame:
-    df = read_df("select barcode, description from products order by description;")
-    return _clean_products_df(df)
-
-
-# -----------------------------
-# Domain logic
-# -----------------------------
-def product_exists(barcode: str) -> bool:
-    row = execute("select 1 as ok from products where barcode=%s;", (barcode,), fetchone=True)
-    return bool(row)
+def cleanup_bad_rows_and_repair_stock():
+    # Deletes header/blank rows + rebuild missing stock rows for real products
+    execute(
+        """
+        delete from public.open_log
+        where barcode is null or trim(barcode) = '' or lower(trim(barcode)) = 'barcode';
+        """
+    )
+    execute(
+        """
+        delete from public.stock
+        where barcode is null or trim(barcode) = '' or lower(trim(barcode)) = 'barcode';
+        """
+    )
+    execute(
+        """
+        delete from public.products
+        where barcode is null or description is null
+           or trim(barcode) = '' or trim(description) = ''
+           or lower(trim(barcode)) = 'barcode'
+           or lower(trim(description)) = 'description';
+        """
+    )
+    execute(
+        """
+        update public.products
+        set barcode = trim(barcode),
+            description = trim(description);
+        """
+    )
+    execute(
+        """
+        insert into public.stock (barcode, closed_boxes, singles, sixpk)
+        select p.barcode, 0, 0, 0
+        from public.products p
+        left join public.stock s on s.barcode = p.barcode
+        where s.barcode is null;
+        """
+    )
 
 
 def ensure_stock_row(barcode: str):
     execute(
         """
-        insert into stock (barcode, closed_boxes, singles, sixpk)
+        insert into public.stock (barcode, closed_boxes, singles, sixpk)
         select p.barcode, 0, 0, 0
-        from products p
+        from public.products p
         where p.barcode = %s
         on conflict (barcode) do nothing;
         """,
@@ -157,31 +166,23 @@ def ensure_stock_row(barcode: str):
     )
 
 
-def repair_all_stock_rows():
-    # Creates missing stock rows for ALL products (one-click repair)
-    execute(
-        """
-        insert into stock (barcode, closed_boxes, singles, sixpk)
-        select p.barcode, 0, 0, 0
-        from products p
-        left join stock s on s.barcode = p.barcode
-        where s.barcode is null;
-        """
-    )
+def product_exists(barcode: str) -> bool:
+    row = execute("select 1 as ok from public.products where barcode=%s;", (barcode,), fetchone=True)
+    return bool(row)
 
 
 def upsert_product(barcode: str, description: str, pack_size, split_mode: str, auto_singles: int, auto_sixpk: int):
     barcode = (barcode or "").strip()
     description = (description or "").strip()
+
     if not barcode or not description:
         raise ValueError("Barcode and Description are required.")
-
     if barcode.lower() == "barcode" or description.lower() == "description":
-        raise ValueError("Invalid product (looks like a header row).")
+        raise ValueError("Invalid barcode/description (looks like a header row).")
 
     execute(
         """
-        insert into products (barcode, description, pack_size, split_mode, auto_singles_per_box, auto_sixpk_per_box)
+        insert into public.products (barcode, description, pack_size, split_mode, auto_singles_per_box, auto_sixpk_per_box)
         values (%s, %s, %s, %s, %s, %s)
         on conflict (barcode) do update set
           description = excluded.description,
@@ -195,18 +196,11 @@ def upsert_product(barcode: str, description: str, pack_size, split_mode: str, a
     ensure_stock_row(barcode)
 
 
-def get_product(barcode: str) -> dict:
-    row = execute("select * from products where barcode=%s;", (barcode,), fetchone=True)
-    if not row:
-        raise ValueError(f"Product not found for barcode: {barcode}")
-    return dict(row)
-
-
 def get_stock(barcode: str) -> dict:
     if not product_exists(barcode):
-        raise ValueError(f"Stock requested for unknown product barcode: {barcode}")
+        raise ValueError(f"Unknown product barcode: {barcode}")
     ensure_stock_row(barcode)
-    row = execute("select * from stock where barcode=%s;", (barcode,), fetchone=True)
+    row = execute("select * from public.stock where barcode=%s;", (barcode,), fetchone=True)
     return dict(row) if row else {"barcode": barcode, "closed_boxes": 0, "singles": 0, "sixpk": 0}
 
 
@@ -216,7 +210,7 @@ def set_stock(barcode: str, closed_boxes: int, singles: int, sixpk: int):
 
     execute(
         """
-        insert into stock (barcode, closed_boxes, singles, sixpk, updated_at)
+        insert into public.stock (barcode, closed_boxes, singles, sixpk, updated_at)
         values (%s, %s, %s, %s, now())
         on conflict (barcode) do update set
           closed_boxes = excluded.closed_boxes,
@@ -229,11 +223,12 @@ def set_stock(barcode: str, closed_boxes: int, singles: int, sixpk: int):
 
 
 def apply_opening(log_date: date, barcode: str, boxes_opened: int, singles_made: int, sixpk_made: int, note: str = ""):
-    prod = get_product(barcode)
-    stk = get_stock(barcode)
+    prod = execute("select * from public.products where barcode=%s;", (barcode,), fetchone=True)
+    if not prod:
+        raise ValueError("Product not found.")
+    prod = dict(prod)
 
-    if boxes_opened < 0:
-        raise ValueError("Boxes opened cannot be negative.")
+    stk = get_stock(barcode)
 
     split_mode = prod["split_mode"]
 
@@ -248,10 +243,7 @@ def apply_opening(log_date: date, barcode: str, boxes_opened: int, singles_made:
         singles_to_store = derived_singles
         sixpk_to_store = derived_sixpk
     else:
-        derived_singles = 0
-        derived_sixpk = 0
-        singles_to_store = 0
-        sixpk_to_store = 0
+        derived_singles = derived_sixpk = singles_to_store = sixpk_to_store = 0
 
     new_closed = int(stk["closed_boxes"]) - int(boxes_opened)
     new_singles = int(stk["singles"]) + int(derived_singles)
@@ -259,7 +251,7 @@ def apply_opening(log_date: date, barcode: str, boxes_opened: int, singles_made:
 
     execute(
         """
-        insert into open_log (log_date, barcode, boxes_opened, singles_made, sixpk_made, note)
+        insert into public.open_log (log_date, barcode, boxes_opened, singles_made, sixpk_made, note)
         values (%s, %s, %s, %s, %s, %s);
         """,
         (log_date, barcode, boxes_opened, singles_to_store, sixpk_to_store, note or ""),
@@ -267,57 +259,12 @@ def apply_opening(log_date: date, barcode: str, boxes_opened: int, singles_made:
 
     set_stock(barcode, new_closed, new_singles, new_sixpk)
 
-    return {
-        "description": prod["description"],
-        "split_mode": split_mode,
-        "derived_singles": derived_singles,
-        "derived_sixpk": derived_sixpk,
-        "new_closed_boxes": new_closed,
-        "new_singles": new_singles,
-        "new_sixpk": new_sixpk,
-    }
-
-
-def undo_last_entry():
-    last = execute("select * from open_log order by id desc limit 1;", fetchone=True)
-    if not last:
-        return False, None
-
-    row = dict(last)
-    barcode = row["barcode"]
-
-    prod = get_product(barcode)
-    stk = get_stock(barcode)
-
-    boxes_opened = int(row["boxes_opened"])
-    singles_made = int(row["singles_made"])
-    sixpk_made = int(row["sixpk_made"])
-
-    if prod["split_mode"] == "AUTO":
-        derived_singles = boxes_opened * int(prod.get("auto_singles_per_box") or 0)
-        derived_sixpk = boxes_opened * int(prod.get("auto_sixpk_per_box") or 0)
-    elif prod["split_mode"] == "MANUAL":
-        derived_singles = singles_made
-        derived_sixpk = sixpk_made
-    else:
-        derived_singles = 0
-        derived_sixpk = 0
-
-    new_closed = int(stk["closed_boxes"]) + boxes_opened
-    new_singles = int(stk["singles"]) - derived_singles
-    new_sixpk = int(stk["sixpk"]) - derived_sixpk
-
-    execute("delete from open_log where id=%s;", (row["id"],))
-    set_stock(barcode, new_closed, new_singles, new_sixpk)
-
-    return True, {"description": prod["description"], "new_closed_boxes": new_closed}
+    return prod["description"], new_closed, new_singles, new_sixpk, derived_singles, derived_sixpk
 
 
 def _safe_int(x) -> int:
     try:
-        if x is None:
-            return 0
-        if pd.isna(x):
+        if x is None or (isinstance(x, float) and pd.isna(x)):
             return 0
         return int(x)
     except Exception:
@@ -325,7 +272,7 @@ def _safe_int(x) -> int:
 
 
 # -----------------------------
-# UI
+# App start
 # -----------------------------
 st.title("📦 Pack Split Tracker (Supabase/Postgres)")
 
@@ -335,13 +282,49 @@ except Exception as e:
     st.error(f"Database init/connect failed: {e}")
     st.stop()
 
-tab1, tab2, tab3 = st.tabs(["✅ Daily Entry", "📊 Dashboard", "➕ Add / Edit Products"])
+tab1, tab2, tab3, tab4 = st.tabs(["✅ Daily Entry", "📊 Dashboard", "➕ Add / Edit Products", "🛠 Diagnostics / Fix"])
 
 
+# -----------------------------
+# Diagnostics tab (THIS will reveal the real issue)
+# -----------------------------
+with tab4:
+    st.subheader("Diagnostics")
+    db_url = _get_database_url()
+    st.code(_redact_db_url(db_url), language="text")
+
+    st.write("Row counts (what THIS app is connected to):")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("products", _safe_int(execute("select count(*) as c from public.products;", fetchone=True)["c"]))
+    with c2:
+        st.metric("stock", _safe_int(execute("select count(*) as c from public.stock;", fetchone=True)["c"]))
+    with c3:
+        st.metric("open_log", _safe_int(execute("select count(*) as c from public.open_log;", fetchone=True)["c"]))
+
+    st.write("Sample products (first 20):")
+    st.dataframe(read_df("select barcode, description, split_mode, pack_size from public.products order by description limit 20;"),
+                 use_container_width=True)
+
+    st.divider()
+    st.subheader("One-click cleanup (removes header rows like 'barcode/description')")
+    if st.button("RUN CLEANUP + REPAIR STOCK (safe)", type="primary"):
+        cleanup_bad_rows_and_repair_stock()
+        st.success("Cleanup done. Refresh the page now (R) or rerun the app.")
+
+    st.caption(
+        "If you click cleanup here and the dashboard still shows header rows, "
+        "then the app is connected to a different DB than you think (wrong DATABASE_URL)."
+    )
+
+
+# -----------------------------
+# Products tab
+# -----------------------------
 with tab3:
     st.subheader("Add / Edit a product")
 
-    cA, cB, cC = st.columns([1.3, 2.2, 1.2])
+    cA, cB, cC = st.columns([1.2, 2.2, 1.2])
     with cA:
         barcode_in = st.text_input("Barcode (unique)", "").strip()
     with cB:
@@ -354,92 +337,99 @@ with tab3:
     auto_singles_in = 0
     auto_sixpk_in = 0
     if split_mode_in == "AUTO":
-        c1, c2 = st.columns(2)
-        with c1:
+        cc1, cc2 = st.columns(2)
+        with cc1:
             auto_singles_in = st.number_input("Auto singles per opened box", min_value=0, value=40, step=1)
-        with c2:
+        with cc2:
             auto_sixpk_in = st.number_input("Auto 6pk per opened box", min_value=0, value=0, step=1)
 
     if st.button("Save Product", type="primary"):
         try:
             upsert_product(
-                barcode=barcode_in,
-                description=desc_in,
-                pack_size=int(pack_size_in) if pack_size_in else None,
-                split_mode=split_mode_in,
-                auto_singles=int(auto_singles_in),
-                auto_sixpk=int(auto_sixpk_in),
+                barcode_in,
+                desc_in,
+                int(pack_size_in) if pack_size_in else None,
+                split_mode_in,
+                int(auto_singles_in),
+                int(auto_sixpk_in),
             )
-            st.success("Saved product.")
+            st.success("Saved.")
         except Exception as e:
-            st.error(f"Save failed: {e}")
-
-    st.divider()
-    st.subheader("Repair / initialize stock rows")
-    st.caption("If you migrated products but stock rows are missing, click this once.")
-    if st.button("Repair missing stock rows"):
-        try:
-            repair_all_stock_rows()
-            st.success("Repaired stock rows.")
-        except Exception as e:
-            st.error(f"Repair failed: {e}")
+            st.error(str(e))
 
     st.divider()
     st.subheader("Set / correct current stock snapshot")
 
-    products_df = load_products_for_picker()
+    products_df = read_df("select barcode, description from public.products order by description;")
+    # filter junk rows at UI level too
+    products_df["barcode"] = products_df["barcode"].astype(str).str.strip()
+    products_df["description"] = products_df["description"].astype(str).str.strip()
+    products_df = products_df[
+        (products_df["barcode"] != "")
+        & (products_df["description"] != "")
+        & (products_df["barcode"].str.lower() != "barcode")
+        & (products_df["description"].str.lower() != "description")
+    ]
+
     if products_df.empty:
-        st.info("No valid products found. (Your products exist, so this means they were loaded in a type that got filtered earlier — this code fixes that.)")
+        st.warning("No products found. Go to Diagnostics tab and run cleanup.")
     else:
         label_map = {r["barcode"]: f"{r['description']} ({r['barcode']})" for _, r in products_df.iterrows()}
-        options = products_df["barcode"].tolist()
-
-        picked_barcode = st.selectbox("Pick product", options, format_func=lambda b: label_map.get(b, b))
+        picked_barcode = st.selectbox("Pick product", products_df["barcode"].tolist(), format_func=lambda b: label_map[b])
         cur = get_stock(picked_barcode)
 
         s1, s2, s3 = st.columns(3)
         with s1:
-            closed_edit = st.number_input("Unopened (closed) boxes", value=_safe_int(cur.get("closed_boxes")), step=1)
+            closed_edit = st.number_input("Unopened (closed) boxes", value=_safe_int(cur["closed_boxes"]), step=1)
         with s2:
-            singles_edit = st.number_input("Singles", value=_safe_int(cur.get("singles")), step=1)
+            singles_edit = st.number_input("Singles", value=_safe_int(cur["singles"]), step=1)
         with s3:
-            sixpk_edit = st.number_input("6-packs", value=_safe_int(cur.get("sixpk")), step=1)
+            sixpk_edit = st.number_input("6-packs", value=_safe_int(cur["sixpk"]), step=1)
 
         if st.button("Update Stock Snapshot"):
             try:
                 set_stock(picked_barcode, int(closed_edit), int(singles_edit), int(sixpk_edit))
                 st.success("Stock updated.")
             except Exception as e:
-                st.error(f"Update failed: {e}")
+                st.error(str(e))
 
 
+# -----------------------------
+# Daily entry tab
+# -----------------------------
 with tab1:
     st.subheader("Log daily openings")
 
-    products = load_products_min()
+    products = read_df("select barcode, description, split_mode, pack_size from public.products order by description;")
+    products["barcode"] = products["barcode"].astype(str).str.strip()
+    products["description"] = products["description"].astype(str).str.strip()
+    products = products[
+        (products["barcode"] != "")
+        & (products["description"] != "")
+        & (products["barcode"].str.lower() != "barcode")
+        & (products["description"].str.lower() != "description")
+    ]
+
     if products.empty:
-        st.info("No valid products found. Click **Repair missing stock rows** in Add/Edit tab, then refresh.")
+        st.info("No valid products found. Go to Diagnostics tab → RUN CLEANUP, then refresh.")
     else:
         label_map = {r["barcode"]: f"{r['description']} ({r['barcode']})" for _, r in products.iterrows()}
-        options = products["barcode"].tolist()
-
         col1, col2, col3 = st.columns([1.2, 2.6, 1.2])
         with col1:
             log_date = st.date_input("Date", value=date.today())
         with col2:
-            barcode = st.selectbox("Product", options, format_func=lambda b: label_map.get(b, b))
+            barcode = st.selectbox("Product", products["barcode"].tolist(), format_func=lambda b: label_map[b])
         with col3:
             boxes_opened = st.number_input("Boxes opened", min_value=0, value=0, step=1)
 
         picked = products[products["barcode"] == barcode].iloc[0]
         split_mode = picked["split_mode"]
-        pack_size = _safe_int(picked["pack_size"])
 
         cur = get_stock(barcode)
         m1, m2, m3 = st.columns(3)
-        m1.metric("Unopened boxes", _safe_int(cur.get("closed_boxes")))
-        m2.metric("Singles", _safe_int(cur.get("singles")))
-        m3.metric("6-packs", _safe_int(cur.get("sixpk")))
+        m1.metric("Unopened boxes", _safe_int(cur["closed_boxes"]))
+        m2.metric("Singles", _safe_int(cur["singles"]))
+        m3.metric("6-packs", _safe_int(cur["sixpk"]))
 
         singles_made = 0
         sixpk_made = 0
@@ -452,42 +442,19 @@ with tab1:
 
         note = st.text_input("Note (optional)", "")
 
-        validate = st.checkbox("Validate manual split (requires pack size)", value=False)
-        if validate and split_mode == "MANUAL" and pack_size > 0:
-            max_units = pack_size * int(boxes_opened)
-            used_units = int(singles_made) + int(sixpk_made) * 6
-            if used_units > max_units:
-                st.error(f"You entered {used_units} units but {boxes_opened} box(es) max is {max_units}.")
-
         if st.button("Save Daily Entry", type="primary"):
             try:
-                res = apply_opening(log_date, barcode, int(boxes_opened), int(singles_made), int(sixpk_made), note)
-                st.success(f"Saved ✅ Unopened boxes still in stock for **{res['description']}**: **{res['new_closed_boxes']}**")
+                desc, new_closed, new_singles, new_sixpk, add_s, add_6 = apply_opening(
+                    log_date, barcode, int(boxes_opened), int(singles_made), int(sixpk_made), note
+                )
+                st.success(f"Saved ✅ {desc} unopened boxes now: {new_closed}")
             except Exception as e:
-                st.error(f"Save failed: {e}")
-
-        if st.button("Undo last entry"):
-            ok, meta = undo_last_entry()
-            if ok:
-                st.success(f"Undid last entry ✅ {meta['description']} unopened boxes now: {meta['new_closed_boxes']}")
-            else:
-                st.info("No entries to undo.")
-
-        st.divider()
-        day_df = read_df(
-            """
-            select l.id, l.log_date, p.description, l.barcode, l.boxes_opened, l.singles_made, l.sixpk_made, l.note, l.created_at
-            from open_log l
-            join products p on p.barcode = l.barcode
-            where l.log_date = %s
-            order by l.id desc;
-            """,
-            (log_date,),
-        )
-        st.subheader("Entries for selected date")
-        st.dataframe(day_df, use_container_width=True)
+                st.error(str(e))
 
 
+# -----------------------------
+# Dashboard tab
+# -----------------------------
 with tab2:
     st.subheader("Current stock position (live)")
 
@@ -503,8 +470,8 @@ with tab2:
           coalesce(s.sixpk, 0) as sixpk,
           (coalesce(s.singles, 0) + coalesce(s.sixpk, 0)*6 + coalesce(s.closed_boxes, 0)*coalesce(p.pack_size, 0)) as total_units_equiv,
           coalesce(s.updated_at, now()) as updated_at
-        from products p
-        left join stock s on s.barcode = p.barcode
+        from public.products p
+        left join public.stock s on s.barcode = p.barcode
         where lower(trim(p.barcode)) not in ('barcode','')
           and lower(trim(p.description)) not in ('description','')
         order by p.description;
@@ -512,17 +479,11 @@ with tab2:
     )
 
     if pos.empty:
-        st.info("No stock rows yet. Go to Add/Edit tab and click **Repair missing stock rows**.")
+        st.info("No rows found. Go to Diagnostics tab and check counts.")
     else:
-        unopened_total = _safe_int(pos["unopened_boxes"].sum())
-        singles_total = _safe_int(pos["singles"].sum())
-        sixpk_total = _safe_int(pos["sixpk"].sum())
-        units_total = _safe_int(pos["total_units_equiv"].sum())
-
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Total unopened boxes", unopened_total)
-        k2.metric("Total singles", singles_total)
-        k3.metric("Total 6-packs", sixpk_total)
-        k4.metric("Total units (equiv)", units_total)
-
+        k1.metric("Total unopened boxes", _safe_int(pos["unopened_boxes"].sum()))
+        k2.metric("Total singles", _safe_int(pos["singles"].sum()))
+        k3.metric("Total 6-packs", _safe_int(pos["sixpk"].sum()))
+        k4.metric("Total units (equiv)", _safe_int(pos["total_units_equiv"].sum()))
         st.dataframe(pos, use_container_width=True)
