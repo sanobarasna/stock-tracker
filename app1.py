@@ -47,14 +47,17 @@ def _connect():
 
 def execute(sql: str, params=None, fetchone=False, fetchall=False):
     params = params or ()
-    with _connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            if fetchone:
-                return cur.fetchone()
-            if fetchall:
-                return cur.fetchall()
-        conn.commit()
+    conn = _connect()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                if fetchone:
+                    return cur.fetchone()
+                if fetchall:
+                    return cur.fetchall()
+    finally:
+        conn.close()
     return None
 
 
