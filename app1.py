@@ -1,331 +1,178 @@
-import os
+import sqlite3
+from pathlib import Path
 from datetime import date
-
 import pandas as pd
 import streamlit as st
-import psycopg2
-from psycopg2.extras import RealDictCursor
 
-st.set_page_config(page_title="Pack Split Tracker (Supabase)", layout="wide")
-
+DB_PATH = Path("pack_tracker.db")
 
 # -----------------------------
 # DB helpers
 # -----------------------------
-def _get_database_url() -> str:
-    if "DATABASE_URL" in st.secrets:
-        return st.secrets["DATABASE_URL"]
-    return os.getenv("DATABASE_URL", "")
+def get_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA foreign_keys = ON;")
+    return conn
 
+def init_db(conn: sqlite3.Connection):
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS products (
+        barcode TEXT PRIMARY KEY,
+        description TEXT NOT NULL,
+        pack_size INTEGER,
+        split_mode TEXT NOT NULL CHECK (split_mode IN ('AUTO','MANUAL','NONE')),
+        auto_singles_per_box INTEGER DEFAULT 0,
+        auto_sixpk_per_box INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+    """)
 
-def _redact_db_url(url: str) -> str:
-    try:
-        left, right = url.split("://", 1)
-        creds, rest = right.split("@", 1)
-        user = creds.split(":", 1)[0]
-        return f"{left}://{user}:***@{rest}"
-    except Exception:
-        return "Could not parse DATABASE_URL (but it is set)."
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS stock (
+        barcode TEXT PRIMARY KEY,
+        closed_boxes INTEGER NOT NULL DEFAULT 0,
+        singles INTEGER NOT NULL DEFAULT 0,
+        sixpk INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT DEFAULT (datetime('now')),
+        FOREIGN KEY(barcode) REFERENCES products(barcode) ON DELETE CASCADE
+    );
+    """)
 
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS open_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        log_date TEXT NOT NULL,
+        barcode TEXT NOT NULL,
+        boxes_opened INTEGER NOT NULL,
+        singles_made INTEGER DEFAULT 0,
+        sixpk_made INTEGER DEFAULT 0,
+        note TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        FOREIGN KEY(barcode) REFERENCES products(barcode) ON DELETE CASCADE
+    );
+    """)
+    conn.commit()
 
-def _connect():
-    db_url = _get_database_url()
-    if not db_url:
-        raise RuntimeError("DATABASE_URL is not set in Streamlit Secrets.")
-    return psycopg2.connect(
-        db_url,
-        sslmode="require",
-        connect_timeout=10,
-        cursor_factory=RealDictCursor,
-        options="-c search_path=public",
-    )
+def read_df(conn, query, params=None):
+    return pd.read_sql_query(query, conn, params=params or ())
 
+def ensure_stock_row(conn, barcode: str):
+    conn.execute("""
+    INSERT INTO stock (barcode, closed_boxes, singles, sixpk)
+    VALUES (?, 0, 0, 0)
+    ON CONFLICT(barcode) DO NOTHING;
+    """, (barcode,))
+    conn.commit()
 
-def execute(sql: str, params=None, fetchone=False, fetchall=False):
-    params = params or ()
-    conn = _connect()
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, params)
-                if fetchone:
-                    return cur.fetchone()
-                if fetchall:
-                    return cur.fetchall()
-    finally:
-        conn.close()
-    return None
+def upsert_product(conn, barcode, description, pack_size, split_mode, auto_singles, auto_sixpk):
+    conn.execute("""
+    INSERT INTO products (barcode, description, pack_size, split_mode, auto_singles_per_box, auto_sixpk_per_box)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(barcode) DO UPDATE SET
+        description=excluded.description,
+        pack_size=excluded.pack_size,
+        split_mode=excluded.split_mode,
+        auto_singles_per_box=excluded.auto_singles_per_box,
+        auto_sixpk_per_box=excluded.auto_sixpk_per_box;
+    """, (barcode, description, pack_size, split_mode, auto_singles, auto_sixpk))
+    ensure_stock_row(conn, barcode)
+    conn.commit()
 
+def set_stock(conn, barcode, closed_boxes, singles, sixpk):
+    conn.execute("""
+    INSERT INTO stock (barcode, closed_boxes, singles, sixpk)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(barcode) DO UPDATE SET
+        closed_boxes=excluded.closed_boxes,
+        singles=excluded.singles,
+        sixpk=excluded.sixpk,
+        updated_at=datetime('now');
+    """, (barcode, closed_boxes, singles, sixpk))
+    conn.commit()
 
-def read_df(sql: str, params=None) -> pd.DataFrame:
-    params = params or ()
-    with _connect() as conn:
-        return pd.read_sql_query(sql, conn, params=params)
+def get_product(conn, barcode: str) -> dict:
+    df = read_df(conn, "SELECT * FROM products WHERE barcode=?", (barcode,))
+    if df.empty:
+        raise ValueError("Product not found in master.")
+    return df.iloc[0].to_dict()
 
+def get_stock(conn, barcode: str) -> dict:
+    ensure_stock_row(conn, barcode)
+    df = read_df(conn, "SELECT * FROM stock WHERE barcode=?", (barcode,))
+    return df.iloc[0].to_dict()
 
-def _safe_int(x) -> int:
-    try:
-        if x is None:
-            return 0
-        return int(x)
-    except Exception:
-        return 0
+def apply_opening(conn, log_date, barcode, boxes_opened, singles_made, sixpk_made, note=""):
+    prod = get_product(conn, barcode)
+    stk = get_stock(conn, barcode)
 
+    if boxes_opened < 0:
+        raise ValueError("Boxes opened cannot be negative.")
 
-# -----------------------------
-# Schema
-# -----------------------------
-def init_db():
-    execute(
-        """
-        create table if not exists public.products (
-          barcode text primary key,
-          description text not null,
-          pack_size int,
-          split_mode text not null check (split_mode in ('AUTO','MANUAL','NONE')),
-          auto_singles_per_box int not null default 0,
-          auto_sixpk_per_box int not null default 0,
-          created_at timestamptz not null default now()
-        );
-        """
-    )
+    # Calculate derived quantities based on split_mode
+    if prod["split_mode"] == "AUTO":
+        derived_singles = boxes_opened * int(prod["auto_singles_per_box"] or 0)
+        derived_sixpk = boxes_opened * int(prod["auto_sixpk_per_box"] or 0)
 
-    execute(
-        """
-        create table if not exists public.stock (
-          barcode text primary key references public.products(barcode) on delete cascade,
-          closed_boxes int not null default 0,
-          singles int not null default 0,
-          sixpk int not null default 0,
-          updated_at timestamptz not null default now()
-        );
-        """
-    )
+        # ignore user-entered singles/sixpk for AUTO
+        singles_made_to_store = 0
+        sixpk_made_to_store = 0
 
-    execute(
-        """
-        create table if not exists public.open_log (
-          id bigserial primary key,
-          log_date date not null,
-          barcode text not null references public.products(barcode) on delete cascade,
-          boxes_opened int not null check (boxes_opened >= 0),
-          singles_made int not null default 0,
-          sixpk_made int not null default 0,
-          note text,
-          created_at timestamptz not null default now()
-        );
-        """
-    )
-
-    execute("create index if not exists idx_open_log_date on public.open_log(log_date);")
-    execute("create index if not exists idx_open_log_barcode on public.open_log(barcode);")
-
-
-# -----------------------------
-# Cleanup + repair
-# -----------------------------
-def cleanup_bad_rows_and_repair_stock():
-    # Remove junk/header rows in ALL tables (exact header values + blanks)
-    execute(
-        """
-        delete from public.open_log
-        where barcode is null
-           or trim(barcode) = ''
-           or lower(trim(barcode)) = 'barcode';
-        """
-    )
-    execute(
-        """
-        delete from public.stock
-        where barcode is null
-           or trim(barcode) = ''
-           or lower(trim(barcode)) = 'barcode';
-        """
-    )
-    execute(
-        """
-        delete from public.products
-        where barcode is null
-           or description is null
-           or trim(barcode) = ''
-           or trim(description) = ''
-           or lower(trim(barcode)) = 'barcode'
-           or lower(trim(description)) = 'description';
-        """
-    )
-
-    # Trim whitespace
-    execute(
-        """
-        update public.products
-        set barcode = trim(barcode),
-            description = trim(description)
-        where barcode is not null and description is not null;
-        """
-    )
-
-    # Ensure every product has a stock row
-    execute(
-        """
-        insert into public.stock (barcode, closed_boxes, singles, sixpk)
-        select p.barcode, 0, 0, 0
-        from public.products p
-        left join public.stock s on s.barcode = p.barcode
-        where s.barcode is null;
-        """
-    )
-
-
-# -----------------------------
-# Business logic helpers
-# -----------------------------
-def ensure_stock_row(barcode: str):
-    execute(
-        """
-        insert into public.stock (barcode, closed_boxes, singles, sixpk)
-        select p.barcode, 0, 0, 0
-        from public.products p
-        where p.barcode = %s
-        on conflict (barcode) do nothing;
-        """,
-        (barcode,),
-    )
-
-
-def product_exists(barcode: str) -> bool:
-    row = execute("select 1 as ok from public.products where barcode=%s;", (barcode,), fetchone=True)
-    return bool(row)
-
-
-def upsert_product(
-    barcode: str,
-    description: str,
-    pack_size,
-    split_mode: str,
-    auto_singles: int,
-    auto_sixpk: int,
-):
-    barcode = (barcode or "").strip()
-    description = (description or "").strip()
-
-    if not barcode or not description:
-        raise ValueError("Barcode and Description are required.")
-    if barcode.lower() == "barcode" or description.lower() == "description":
-        raise ValueError("Invalid barcode/description (looks like a header row).")
-
-    execute(
-        """
-        insert into public.products (barcode, description, pack_size, split_mode, auto_singles_per_box, auto_sixpk_per_box)
-        values (%s, %s, %s, %s, %s, %s)
-        on conflict (barcode) do update set
-          description = excluded.description,
-          pack_size = excluded.pack_size,
-          split_mode = excluded.split_mode,
-          auto_singles_per_box = excluded.auto_singles_per_box,
-          auto_sixpk_per_box = excluded.auto_sixpk_per_box;
-        """,
-        (barcode, description, pack_size, split_mode, auto_singles, auto_sixpk),
-    )
-    ensure_stock_row(barcode)
-
-
-def get_stock(barcode: str) -> dict:
-    if not product_exists(barcode):
-        raise ValueError(f"Unknown product barcode: {barcode}")
-    ensure_stock_row(barcode)
-    row = execute("select * from public.stock where barcode=%s;", (barcode,), fetchone=True)
-    return dict(row) if row else {"barcode": barcode, "closed_boxes": 0, "singles": 0, "sixpk": 0}
-
-
-def set_stock(barcode: str, closed_boxes: int, singles: int, sixpk: int):
-    if not product_exists(barcode):
-        raise ValueError(f"Cannot set stock: product not found for barcode {barcode}")
-
-    execute(
-        """
-        insert into public.stock (barcode, closed_boxes, singles, sixpk, updated_at)
-        values (%s, %s, %s, %s, now())
-        on conflict (barcode) do update set
-          closed_boxes = excluded.closed_boxes,
-          singles = excluded.singles,
-          sixpk = excluded.sixpk,
-          updated_at = now();
-        """,
-        (barcode, closed_boxes, singles, sixpk),
-    )
-
-
-def apply_opening(
-    log_date: date,
-    barcode: str,
-    boxes_opened: int,
-    singles_made: int,
-    sixpk_made: int,
-    note: str = "",
-):
-    prod = execute("select * from public.products where barcode=%s;", (barcode,), fetchone=True)
-    if not prod:
-        raise ValueError("Product not found.")
-    prod = dict(prod)
-
-    stk = get_stock(barcode)
-    split_mode = prod["split_mode"]
-
-    if split_mode == "AUTO":
-        derived_singles = boxes_opened * int(prod.get("auto_singles_per_box") or 0)
-        derived_sixpk = boxes_opened * int(prod.get("auto_sixpk_per_box") or 0)
-        singles_to_store = 0
-        sixpk_to_store = 0
-    elif split_mode == "MANUAL":
+    elif prod["split_mode"] == "MANUAL":
         derived_singles = int(singles_made or 0)
         derived_sixpk = int(sixpk_made or 0)
-        singles_to_store = derived_singles
-        sixpk_to_store = derived_sixpk
-    else:
+
+        singles_made_to_store = int(singles_made or 0)
+        sixpk_made_to_store = int(sixpk_made or 0)
+
+    else:  # NONE
         derived_singles = 0
         derived_sixpk = 0
-        singles_to_store = 0
-        sixpk_to_store = 0
+        singles_made_to_store = 0
+        sixpk_made_to_store = 0
 
+    # Update stock
     new_closed = int(stk["closed_boxes"]) - int(boxes_opened)
     new_singles = int(stk["singles"]) + int(derived_singles)
     new_sixpk = int(stk["sixpk"]) + int(derived_sixpk)
 
-    execute(
-        """
-        insert into public.open_log (log_date, barcode, boxes_opened, singles_made, sixpk_made, note)
-        values (%s, %s, %s, %s, %s, %s);
-        """,
-        (log_date, barcode, boxes_opened, singles_to_store, sixpk_to_store, note or ""),
-    )
+    # Save log
+    conn.execute("""
+    INSERT INTO open_log (log_date, barcode, boxes_opened, singles_made, sixpk_made, note)
+    VALUES (?, ?, ?, ?, ?, ?)
+    """, (str(log_date), barcode, int(boxes_opened), singles_made_to_store, sixpk_made_to_store, note or ""))
 
-    set_stock(barcode, new_closed, new_singles, new_sixpk)
+    # Save stock snapshot
+    set_stock(conn, barcode, new_closed, new_singles, new_sixpk)
+    conn.commit()
 
-    return prod["description"], new_closed, new_singles, new_sixpk, derived_singles, derived_sixpk
+    return {
+        "new_closed_boxes": new_closed,
+        "new_singles": new_singles,
+        "new_sixpk": new_sixpk,
+        "derived_singles": derived_singles,
+        "derived_sixpk": derived_sixpk,
+        "split_mode": prod["split_mode"],
+        "description": prod["description"],
+    }
 
-
-def undo_last_entry():
-    last_row = execute("select * from public.open_log order by id desc limit 1;", fetchone=True)
-    if not last_row:
+def undo_last_entry(conn):
+    last = read_df(conn, "SELECT * FROM open_log ORDER BY id DESC LIMIT 1")
+    if last.empty:
         return False, None
 
-    last_row = dict(last_row)
-    barcode = last_row["barcode"]
+    row = last.iloc[0].to_dict()
+    barcode = row["barcode"]
 
-    prod = execute("select * from public.products where barcode=%s;", (barcode,), fetchone=True)
-    if not prod:
-        return False, None
-    prod = dict(prod)
+    prod = get_product(conn, barcode)
+    stk = get_stock(conn, barcode)
 
-    stk = get_stock(barcode)
-
-    boxes_opened = int(last_row["boxes_opened"])
-    singles_made = int(last_row["singles_made"] or 0)
-    sixpk_made = int(last_row["sixpk_made"] or 0)
+    boxes_opened = int(row["boxes_opened"])
+    singles_made = int(row["singles_made"] or 0)
+    sixpk_made = int(row["sixpk_made"] or 0)
 
     if prod["split_mode"] == "AUTO":
-        derived_singles = boxes_opened * int(prod.get("auto_singles_per_box") or 0)
-        derived_sixpk = boxes_opened * int(prod.get("auto_sixpk_per_box") or 0)
+        derived_singles = boxes_opened * int(prod["auto_singles_per_box"] or 0)
+        derived_sixpk = boxes_opened * int(prod["auto_sixpk_per_box"] or 0)
     elif prod["split_mode"] == "MANUAL":
         derived_singles = singles_made
         derived_sixpk = sixpk_made
@@ -337,59 +184,23 @@ def undo_last_entry():
     new_singles = int(stk["singles"]) - derived_singles
     new_sixpk = int(stk["sixpk"]) - derived_sixpk
 
-    execute("delete from public.open_log where id=%s;", (last_row["id"],))
-    set_stock(barcode, new_closed, new_singles, new_sixpk)
+    conn.execute("DELETE FROM open_log WHERE id=?", (row["id"],))
+    set_stock(conn, barcode, new_closed, new_singles, new_sixpk)
+    conn.commit()
 
-    return True, {"barcode": barcode, "description": prod["description"], "new_closed_boxes": new_closed}
-
-
-# -----------------------------
-# App start
-# -----------------------------
-st.title("📦 Pack Split Tracker (Supabase/Postgres)")
-
-try:
-    init_db()
-except Exception as e:
-    st.error(f"Database init/connect failed: {e}")
-    st.stop()
-
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["✅ Daily Entry", "📊 Dashboard", "➕ Add / Edit Products", "🛠 Diagnostics / Fix"]
-)
-
+    return True, {"barcode": barcode, "new_closed_boxes": new_closed}
 
 # -----------------------------
-# Tab 4: Diagnostics
+# UI
 # -----------------------------
-with tab4:
-    st.subheader("Diagnostics")
-    db_url = _get_database_url()
-    st.code(_redact_db_url(db_url), language="text")
+st.set_page_config(page_title="Pack Split Tracker", layout="wide")
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("products", _safe_int(execute("select count(*) as c from public.products;", fetchone=True)["c"]))
-    with c2:
-        st.metric("stock", _safe_int(execute("select count(*) as c from public.stock;", fetchone=True)["c"]))
-    with c3:
-        st.metric("open_log", _safe_int(execute("select count(*) as c from public.open_log;", fetchone=True)["c"]))
+conn = get_conn()
+init_db(conn)
 
-    st.write("Sample products (first 20):")
-    st.dataframe(
-        read_df("select barcode, description, split_mode, pack_size from public.products order by description limit 20;"),
-        use_container_width=True,
-    )
+st.title("📦 Pack Split Tracker (Daily Boxes → Singles & 6-Packs)")
 
-    st.divider()
-    st.subheader("One-click cleanup (removes header rows + repairs missing stock)")
-    if st.button("RUN CLEANUP + REPAIR STOCK", type="primary"):
-        try:
-            cleanup_bad_rows_and_repair_stock()
-            st.success("Cleanup + repair complete. Refresh the app now.")
-        except Exception as e:
-            st.error(str(e))
-
+tab1, tab2, tab3 = st.tabs(["✅ Daily Entry", "📊 Dashboard", "➕ Add / Edit Products"])
 
 # -----------------------------
 # Tab 3: Add/Edit Products
@@ -397,101 +208,90 @@ with tab4:
 with tab3:
     st.subheader("Add / Edit a product")
 
-    cA, cB, cC = st.columns([1.2, 2.2, 1.2])
-    with cA:
-        barcode_in = st.text_input("Barcode (unique)", "").strip()
-    with cB:
-        desc_in = st.text_input("Description", "").strip()
-    with cC:
-        pack_size_in = st.number_input("Pack size (optional)", min_value=0, value=0, step=1)
+    colA, colB, colC = st.columns([1.2, 2, 1.2])
+    with colA:
+        barcode = st.text_input("Barcode (unique)", "")
+    with colB:
+        description = st.text_input("Description", "")
+    with colC:
+        pack_size = st.number_input("Pack size (optional)", min_value=0, value=0, step=1)
 
-    split_mode_in = st.selectbox("Split mode", ["MANUAL", "AUTO", "NONE"], index=0)
+    split_mode = st.selectbox("Split mode", ["MANUAL", "AUTO", "NONE"], index=0)
 
-    auto_singles_in = 0
-    auto_sixpk_in = 0
-    if split_mode_in == "AUTO":
-        st.info("AUTO mode calculates singles/6pk automatically per opened box.")
-        cc1, cc2 = st.columns(2)
-        with cc1:
-            auto_singles_in = st.number_input("Auto singles per opened box", min_value=0, value=40, step=1)
-        with cc2:
-            auto_sixpk_in = st.number_input("Auto 6pk per opened box", min_value=0, value=0, step=1)
+    auto_singles = 0
+    auto_sixpk = 0
+    if split_mode == "AUTO":
+        st.info("AUTO means the app calculates singles/6pk every time you open a box.")
+        c1, c2 = st.columns(2)
+        with c1:
+            auto_singles = st.number_input("Auto singles per opened box", min_value=0, value=40, step=1)
+        with c2:
+            auto_sixpk = st.number_input("Auto 6pk per opened box", min_value=0, value=0, step=1)
 
     if st.button("Save Product", type="primary"):
-        try:
+        if not barcode.strip() or not description.strip():
+            st.error("Barcode and Description are required.")
+        else:
             upsert_product(
-                barcode_in,
-                desc_in,
-                int(pack_size_in) if pack_size_in else None,
-                split_mode_in,
-                int(auto_singles_in),
-                int(auto_sixpk_in),
+                conn,
+                barcode.strip(),
+                description.strip(),
+                int(pack_size) if pack_size else None,
+                split_mode,
+                int(auto_singles),
+                int(auto_sixpk)
             )
             st.success("Saved product (and ensured stock row exists).")
-        except Exception as e:
-            st.error(str(e))
 
     st.divider()
-    st.subheader("Set / correct current stock (recommended)")
-
-    products_df = read_df("select barcode, description from public.products order by description;")
-    products_df["barcode"] = products_df["barcode"].astype(str).str.strip()
-    products_df["description"] = products_df["description"].astype(str).str.strip()
-    products_df = products_df[
-        (products_df["barcode"] != "")
-        & (products_df["description"] != "")
-        & (products_df["barcode"].str.lower() != "barcode")
-        & (products_df["description"].str.lower() != "description")
-    ]
-
-    if products_df.empty:
-        st.warning("No products found yet.")
+    st.subheader("Set / correct current stock (optional but recommended)")
+    products = read_df(conn, "SELECT barcode, description FROM products ORDER BY description")
+    if products.empty:
+        st.warning("No products yet. Add products first.")
     else:
-        label_map = {r["barcode"]: f"{r['description']} ({r['barcode']})" for _, r in products_df.iterrows()}
-        picked_barcode = st.selectbox("Pick product", products_df["barcode"].tolist(), format_func=lambda b: label_map[b])
-        cur = get_stock(picked_barcode)
+        pick = st.selectbox(
+            "Pick product",
+            products["barcode"].tolist(),
+            format_func=lambda b: f"{products.loc[products['barcode']==b,'description'].iloc[0]} ({b})"
+        )
 
-        s1, s2, s3 = st.columns(3)
-        with s1:
-            closed_edit = st.number_input("Unopened (closed) boxes", value=_safe_int(cur["closed_boxes"]), step=1)
-        with s2:
-            singles_edit = st.number_input("Singles", value=_safe_int(cur["singles"]), step=1)
-        with s3:
-            sixpk_edit = st.number_input("6-packs", value=_safe_int(cur["sixpk"]), step=1)
+        cur = get_stock(conn, pick)
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            closed = st.number_input("Unopened (closed) boxes", value=int(cur["closed_boxes"]), step=1)
+        with c2:
+            singles = st.number_input("Singles", value=int(cur["singles"]), step=1)
+        with c3:
+            sixpk = st.number_input("6-packs", value=int(cur["sixpk"]), step=1)
 
         if st.button("Update Stock Snapshot"):
-            try:
-                set_stock(picked_barcode, int(closed_edit), int(singles_edit), int(sixpk_edit))
-                st.success("Stock updated.")
-            except Exception as e:
-                st.error(str(e))
-
+            set_stock(conn, pick, int(closed), int(singles), int(sixpk))
+            st.success("Stock updated.")
 
 # -----------------------------
 # Tab 1: Daily Entry
 # -----------------------------
 with tab1:
-    st.subheader("Log today's openings")
+    st.subheader("Log today’s openings")
 
-    products = read_df("select barcode, description, split_mode, pack_size from public.products order by description;")
-    products["barcode"] = products["barcode"].astype(str).str.strip()
-    products["description"] = products["description"].astype(str).str.strip()
-    products = products[
-        (products["barcode"] != "")
-        & (products["description"] != "")
-        & (products["barcode"].str.lower() != "barcode")
-        & (products["description"].str.lower() != "description")
-    ]
+    products = read_df(conn, """
+        SELECT p.barcode, p.description, p.split_mode, p.pack_size
+        FROM products p
+        ORDER BY p.description
+    """)
 
     if products.empty:
-        st.warning("Add products first in the 'Add / Edit Products' tab.")
+        st.warning("Add products first in the ‘Add / Edit Products’ tab.")
     else:
-        label_map = {r["barcode"]: f"{r['description']} ({r['barcode']})" for _, r in products.iterrows()}
         col1, col2, col3 = st.columns([1.2, 2.5, 1.2])
         with col1:
             log_date = st.date_input("Date", value=date.today())
         with col2:
-            barcode = st.selectbox("Product", products["barcode"].tolist(), format_func=lambda b: label_map[b])
+            barcode = st.selectbox(
+                "Product",
+                products["barcode"].tolist(),
+                format_func=lambda b: f"{products.loc[products['barcode']==b,'description'].iloc[0]} ({b})"
+            )
         with col3:
             boxes_opened = st.number_input("Boxes opened", min_value=0, value=0, step=1)
 
@@ -499,33 +299,36 @@ with tab1:
         split_mode = picked["split_mode"]
         pack_size = picked["pack_size"]
 
-        cur = get_stock(barcode)
+        # LIVE stock snapshot (before saving)
+        cur = get_stock(conn, barcode)
         st.caption("Current stock snapshot (before saving):")
-        a, b, c = st.columns(3)
-        a.metric("Unopened boxes", _safe_int(cur["closed_boxes"]))
-        b.metric("Singles", _safe_int(cur["singles"]))
-        c.metric("6-packs", _safe_int(cur["sixpk"]))
+        s1, s2, s3 = st.columns(3)
+        s1.metric("Unopened boxes (current)", int(cur["closed_boxes"]))
+        s2.metric("Singles (current)", int(cur["singles"]))
+        s3.metric("6-packs (current)", int(cur["sixpk"]))
 
         singles_made = 0
         sixpk_made = 0
+
         if split_mode == "MANUAL":
-            st.info("Manual mode: enter singles/6pk made.")
+            st.info("Manual mode: enter singles/6pk made (for sodas or items you want to split differently).")
             c1, c2 = st.columns(2)
             with c1:
                 singles_made = st.number_input("Singles made (manual)", min_value=0, value=0, step=1)
             with c2:
                 sixpk_made = st.number_input("6-packs made (manual)", min_value=0, value=0, step=1)
         elif split_mode == "AUTO":
-            st.success("Auto mode: singles/6pk will be calculated automatically.")
+            st.success("Auto mode: the app will calculate singles/6pk for you.")
         else:
-            st.warning("No-split mode: only unopened boxes reduce.")
+            st.warning("No-split mode: only unopened boxes will be reduced.")
 
         note = st.text_input("Note (optional)", "")
 
+        # Optional validation for MANUAL (helps catch mistakes)
         validate = st.checkbox("Validate manual split (requires pack size)", value=False)
         if validate and split_mode == "MANUAL":
             if not pack_size or int(pack_size) == 0:
-                st.error("Pack size missing for this product. Add it in Add/Edit Products.")
+                st.error("Pack size is missing for this product. Add it in Add/Edit Products.")
             else:
                 max_units = int(pack_size) * int(boxes_opened)
                 used_units = int(singles_made) + int(sixpk_made) * 6
@@ -534,43 +337,58 @@ with tab1:
                 else:
                     st.caption(f"Manual units used: {used_units} / {max_units}")
 
+        # Save and immediately show unopened boxes still in stock
         if st.button("Save Daily Entry", type="primary"):
             try:
-                desc, new_closed, new_singles, new_sixpk, add_s, add_6 = apply_opening(
-                    log_date, barcode, int(boxes_opened), int(singles_made), int(sixpk_made), note
+                result = apply_opening(
+                    conn,
+                    log_date,
+                    barcode,
+                    int(boxes_opened),
+                    int(singles_made),
+                    int(sixpk_made),
+                    note
                 )
-                st.success(f"Saved ✅ {desc} unopened boxes now: {new_closed}")
 
-                x1, x2, x3 = st.columns(3)
-                x1.metric("Unopened boxes (after)", new_closed)
-                x2.metric("Singles (after)", new_singles)
-                x3.metric("6-packs (after)", new_sixpk)
+                st.success(
+                    f"Saved! ✅ Unopened boxes still in stock for "
+                    f"**{result['description']}**: **{result['new_closed_boxes']}**"
+                )
 
-                st.caption(f"Added from this entry → Singles: {add_s}, 6-packs: {add_6} (mode: {split_mode})")
+                # Show after-save snapshot (what changed)
+                a1, a2, a3 = st.columns(3)
+                a1.metric("Unopened boxes (after save)", int(result["new_closed_boxes"]))
+                a2.metric("Singles (after save)", int(result["new_singles"]))
+                a3.metric("6-packs (after save)", int(result["new_sixpk"]))
+
+                # Also show what was added (useful confirmation)
+                st.caption(
+                    f"Added from this entry → Singles: {int(result['derived_singles'])}, "
+                    f"6-packs: {int(result['derived_sixpk'])} (mode: {result['split_mode']})"
+                )
+
             except Exception as e:
                 st.error(str(e))
 
-        if st.button("Undo last entry"):
-            ok, meta = undo_last_entry()
-            if ok:
-                st.success(f"Undid last entry for {meta['description']}. Unopened boxes now: {meta['new_closed_boxes']}")
-            else:
-                st.info("No entries to undo.")
+        cA, cB = st.columns([1, 1])
+        with cA:
+            if st.button("Undo last entry"):
+                ok, meta = undo_last_entry(conn)
+                if ok:
+                    st.success(f"Undid last entry. Unopened boxes now: {meta['new_closed_boxes']}")
+                else:
+                    st.info("No entries to undo.")
 
         st.divider()
         st.subheader("Entries for selected date")
-        day_df = read_df(
-            """
-            select l.id, l.log_date, p.description, l.barcode, l.boxes_opened, l.singles_made, l.sixpk_made, l.note
-            from public.open_log l
-            join public.products p on p.barcode = l.barcode
-            where l.log_date = %s
-            order by l.id desc;
-            """,
-            (str(log_date),),
-        )
+        day_df = read_df(conn, """
+            SELECT l.id, l.log_date, p.description, l.barcode, l.boxes_opened, l.singles_made, l.sixpk_made, l.note
+            FROM open_log l
+            JOIN products p ON p.barcode = l.barcode
+            WHERE l.log_date = ?
+            ORDER BY l.id DESC
+        """, (str(log_date),))
         st.dataframe(day_df, use_container_width=True)
-
 
 # -----------------------------
 # Tab 2: Dashboard
@@ -578,41 +396,35 @@ with tab1:
 with tab2:
     st.subheader("Current stock position (live)")
 
-    pos = read_df(
-        """
-        select
-          p.description,
-          p.barcode,
-          p.split_mode,
-          coalesce(p.pack_size, 0) as pack_size,
-          coalesce(s.closed_boxes, 0) as unopened_boxes,
-          coalesce(s.singles, 0) as singles,
-          coalesce(s.sixpk, 0) as sixpk,
-          (coalesce(s.singles, 0) + coalesce(s.sixpk, 0)*6 + coalesce(s.closed_boxes, 0)*coalesce(p.pack_size, 0)) as total_units_equiv,
-          coalesce(s.updated_at, now()) as updated_at
-        from public.products p
-        left join public.stock s on s.barcode = p.barcode
-        where lower(trim(p.barcode)) not in ('barcode','')
-          and lower(trim(p.description)) not in ('description','')
-        order by p.description;
-        """
-    )
+    pos = read_df(conn, """
+        SELECT
+            p.description,
+            p.barcode,
+            p.split_mode,
+            COALESCE(p.pack_size, 0) AS pack_size,
+            COALESCE(s.closed_boxes, 0) AS unopened_boxes,
+            COALESCE(s.singles, 0) AS singles,
+            COALESCE(s.sixpk, 0) AS sixpk,
+            (COALESCE(s.singles, 0) + COALESCE(s.sixpk, 0)*6 + COALESCE(s.closed_boxes, 0)*COALESCE(p.pack_size, 0)) AS total_units_equiv
+        FROM products p
+        LEFT JOIN stock s ON s.barcode = p.barcode
+        ORDER BY p.description
+    """)
 
     if pos.empty:
-        st.info("No data yet. Add products and stock in the Add/Edit Products tab.")
+        st.info("No data yet.")
     else:
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Total unopened boxes", _safe_int(pos["unopened_boxes"].sum()))
-        k2.metric("Total singles", _safe_int(pos["singles"].sum()))
-        k3.metric("Total 6-packs", _safe_int(pos["sixpk"].sum()))
-        k4.metric("Total units (equiv)", _safe_int(pos["total_units_equiv"].sum()))
+        k1.metric("Total unopened boxes", int(pos["unopened_boxes"].sum()))
+        k2.metric("Total singles", int(pos["singles"].sum()))
+        k3.metric("Total 6-packs", int(pos["sixpk"].sum()))
+        k4.metric("Total units (equiv)", int(pos["total_units_equiv"].sum()))
 
         st.dataframe(pos, use_container_width=True)
 
         st.divider()
         st.subheader("Low stock alerts (unopened boxes)")
         threshold = st.number_input("Low threshold (unopened boxes)", min_value=0, value=2, step=1)
-        pos["unopened_boxes"] = pd.to_numeric(pos["unopened_boxes"], errors="coerce").fillna(0).astype(int)
         low = pos[pos["unopened_boxes"] <= threshold][["description", "barcode", "unopened_boxes", "split_mode"]]
         if low.empty:
             st.success("No low-stock items at this threshold.")
@@ -622,5 +434,6 @@ with tab2:
 
         st.divider()
         st.subheader("Export")
-        csv = pos.to_csv(index=False).encode("utf-8")
+        export = pos.copy()
+        csv = export.to_csv(index=False).encode("utf-8")
         st.download_button("Download stock_position.csv", data=csv, file_name="stock_position.csv", mime="text/csv")
