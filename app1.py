@@ -592,6 +592,7 @@ with tab2:
         st.divider()
         st.subheader("Low stock alerts (unopened boxes)")
         threshold = st.number_input("Low threshold (unopened boxes)", min_value=0, value=2, step=1)
+        pos["unopened_boxes"] = pd.to_numeric(pos["unopened_boxes"], errors="coerce").fillna(0).astype(int)
         low = pos[pos["unopened_boxes"] <= threshold][["description", "barcode", "unopened_boxes", "split_mode"]]
         if low.empty:
             st.success("No low-stock items at this threshold.")
